@@ -6,6 +6,7 @@ import WebSocket from 'ws';
 import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
+import { pairingMessage } from '../src/pairing.js';
 
 type Message = NonNullable<ReturnType<typeof publicMessage>>;
 type Submission = { id: string; timer: ReturnType<typeof setTimeout>; timedOut: boolean };
@@ -194,7 +195,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
       if (action === 'off') { stop(); context.ui.notify('Remote access disabled.', 'info'); return; }
       if (!['', 'on', 'setup'].includes(action)) { context.ui.notify('Usage: /remote [setup|on|off]', 'warning'); return; }
       if (action === 'setup' && enabled) { context.ui.notify('Run /remote off before setup so active access is not reconfigured.', 'warning'); return; }
-      if (enabled) { context.ui.notify(`Phone pairing link (keep private):\n${link}`, 'info'); return; }
+      if (enabled) { context.ui.notify(pairingMessage(link, process.stdout?.columns), 'info'); return; }
       if (operation) { context.ui.notify('Remote configuration is in progress. Finish it or run /remote off to cancel.', 'warning'); return; }
       if (action === 'setup' && !context.hasUI) { context.ui.notify('/remote setup requires an interactive UI. Set PI_REMOTE_URL and PI_REMOTE_TOKEN instead.', 'error'); return; }
       const controller = new AbortController(); operation = controller;
@@ -213,7 +214,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
           .map(entry => publicMessage((entry as { message: unknown }).message)).filter((m): m is Message => !!m).slice(-40);
         activeTools.clear(); commands.clear(); revision = 0; retry = 0; submitting = false; streamingIndex = -1;
         enabled = true; status('Remote connecting… · /remote off'); connect();
-        context.ui.notify(`Phone pairing link (grants control; keep private):\n${link}`, 'info');
+        context.ui.notify(pairingMessage(link, process.stdout?.columns), 'info');
       } catch (error) {
         if (!controller.signal.aborted) context.ui.notify(`Remote ${action === 'setup' ? 'setup' : 'configuration'} failed: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error');
       } finally { if (operation === controller) operation = undefined; }

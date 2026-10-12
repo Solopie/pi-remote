@@ -11,6 +11,7 @@ import { getModel } from '@earendil-works/pi-ai/compat';
 import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
+import { pairingMessage } from '../src/pairing.js';
 
 test('Pi 1.1.0 supports interactive setup and preserves submission identity through delayed, transformed preflight', { timeout: 10000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'pi-remote-submission-'));
@@ -30,7 +31,7 @@ test('Pi 1.1.0 supports interactive setup and preserves submission identity thro
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
   const context = vm.createContext({ WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join, setTimeout, clearTimeout,
     getAgentDir: () => dir, process: { env: {} },
-    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig });
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage });
   const remote = vm.runInContext(`${source}\nremoteExtension;`, context);
   let release, entered, settled, remoteReleased = false, remoteInputs = 0;
   const gate = new Promise(resolve => { release = resolve; });
@@ -72,7 +73,11 @@ test('Pi 1.1.0 supports interactive setup and preserves submission identity thro
   assert.ok(notices.at(-1).includes(`export PI_REMOTE_TOKEN='${config.token}'`));
   assert.equal(session.sessionManager.getBranch().filter(entry => entry.type === 'message').length, 0);
   await session.prompt('/remote');
-  const key = new URLSearchParams(new URL(notices.at(-1).split('\n').at(-1)).hash.slice(1)).get('key');
+  const pairing = notices.at(-1);
+  assert.match(pairing, /[▀▄█]/); assert.ok(!pairing.includes(config.token));
+  assert.equal(session.sessionManager.getBranch().filter(entry => entry.type === 'message').length, 0);
+  await session.prompt('/remote'); assert.equal(notices.at(-1), pairing);
+  const key = new URLSearchParams(new URL(pairing.split('\n').at(-1)).hash.slice(1)).get('key');
   const ws = sockets[0]; ws.emit('open'); ws.emit('message', JSON.stringify({ type: 'joined' }));
   const command = { id: '12345678', action: 'prompt', text: 'work', createdAt: Date.now() };
   const send = () => ws.emit('message', JSON.stringify({ type: 'command', payload: seal(key, command, 'client', 'command') }));

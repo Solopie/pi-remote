@@ -11,6 +11,7 @@ import { createRelay } from '../src/server.js';
 import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot, MAX_SNAPSHOT_BYTES } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
+import { pairingMessage } from '../src/pairing.js';
 
 const token = randomToken();
 async function relay(t, options = {}) {
@@ -272,7 +273,7 @@ test('snapshot publication bounds metadata and contains timer callback failures'
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
   const context = vm.createContext({ pi, WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join,
     getAgentDir: () => '/unused-pi-remote-test', process: { env: { PI_REMOTE_URL: 'http://localhost:8787', PI_REMOTE_TOKEN: token } },
-    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig,
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage,
     setTimeout: fn => { callback = fn; return 1; }, clearTimeout() {} });
   vm.runInContext(`${source}\nremoteExtension(pi);`, context);
   await handler('', ctx);

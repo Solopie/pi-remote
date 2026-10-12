@@ -11,6 +11,7 @@ import { createRelay } from '../src/server.js';
 import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
+import { pairingMessage } from '../src/pairing.js';
 
 async function extension(t, branch = []) {
   const timers = new Map(), sockets = [], events = new Map(), notices = [], statuses = [], prompts = [], starts = [];
@@ -51,7 +52,7 @@ async function extension(t, branch = []) {
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
   const context = vm.createContext({ pi, WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join: pathJoin,
     getAgentDir: () => '/unused-pi-remote-test', process: { env: { PI_REMOTE_URL: 'http://localhost:8787', PI_REMOTE_TOKEN: randomToken() } },
-    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig,
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage,
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout });
   vm.runInContext(`${source}\nremoteExtension(pi);`, context);
   await handler('', ctx);
@@ -67,6 +68,23 @@ async function extension(t, branch = []) {
     startSubmission(index = starts.length - 1) { starts[index](); },
     setIdle(value) { idle = value; }, get interrupts() { return interrupts; } };
 }
+
+test('/remote displays a private QR and copyable link, reuses the pairing, and rotates it after revocation', async t => {
+  const h = await extension(t), original = h.notices.at(-1);
+  assert.match(original, /Scan with your phone's camera/); assert.match(original, /[▀▄█]/);
+  assert.equal(original, pairingMessage(original.split('\n').at(-1)));
+  assert.ok(!original.includes(h.sockets[0].sent.find(packet => packet.type === 'join').token));
+  assert.deepEqual(h.prompts, []);
+  await h.handler('on', h.ctx);
+  assert.equal(h.notices.at(-1), original); assert.equal(h.sockets.length, 1);
+  await h.handler('off', h.ctx);
+  assert.equal(h.notices.at(-1), 'Remote access disabled.');
+  await h.handler('', h.ctx);
+  const next = h.notices.at(-1);
+  assert.notEqual(next.split('\n').at(-1), original.split('\n').at(-1));
+  assert.equal(next, pairingMessage(next.split('\n').at(-1)));
+  assert.deepEqual(h.prompts, []);
+});
 
 test('extension bounds stalled outbound buffering and republishes only latest state after reconnect', async t => {
   const h = await extension(t, Array.from({ length: 40 }, () => ({ type: 'message', message: { role: 'user', content: '\0'.repeat(4000) } })));
