@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#10151e"><meta name="referrer" content="no-referrer">
+  <title>Pi Remote</title><link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main>
+    <header><div><h1>π remote</h1><p id="session">Your coding agent, anywhere.</p></div><button id="disconnect" hidden>Disconnect</button></header>
+    <section id="pair"><h2>Connect to your session</h2><p>Run <code>/remote</code> in pi, then open its private pairing link on this phone—or paste it below.</p>
+      <form id="pair-form"><label for="pair-link">Pairing link</label><input id="pair-link" type="password" autocomplete="off" placeholder="https://relay.example/#room=…&key=…" required><button>Connect</button></form>
+      <p class="muted">Anyone with the link can control your agent. Run <code>/remote off</code> in pi to revoke access.</p>
+    </section>
+    <section id="workspace" hidden>
+      <div class="statusbar"><span id="status" role="status">Connecting…</span><button id="interrupt" disabled>Stop agent</button></div>
+      <div id="messages" aria-label="Conversation"></div>
+      <p id="activity" class="muted"></p>
+      <form id="prompt-form"><label for="prompt">Message your agent</label><textarea id="prompt" rows="3" maxlength="16000" placeholder="What should we work on?" required></textarea><div class="send-row"><span class="muted">Enter for newline · Ctrl/⌘ Enter to send</span><button id="send" disabled>Send</button></div></form>
+    </section>
+    <p id="notice" role="status"></p>
+  </main>
+</body></html>
