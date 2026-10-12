@@ -11,6 +11,7 @@ pi session → outbound WSS → relay ← WSS ← phone browser
 ## Features
 
 - `/remote` enables access; `/remote off` disables it and invalidates the active pairing on a connected relay.
+- `/remote setup` prompts for the relay URL, generates a strong random token, and saves private local settings.
 - Private pairing link with an end-to-end AES-256-GCM key in the URL fragment (not sent in HTTP requests).
 - Existing conversation, streamed assistant text, active tool names, expandable tool results.
 - Send a prompt while idle; interrupt a running agent. Busy prompts are explicitly rejected, not silently queued.
@@ -24,20 +25,55 @@ pi session → outbound WSS → relay ← WSS ← phone browser
 - Pi 1.1.0 (`@earendil-works/pi-coding-agent`); extension APIs are version-specific.
 - HTTPS relay address reachable from both devices. HTTP is supported only for local development on localhost.
 
+The examples below use `/path/to/pi-remote` as a placeholder for your local checkout. Replace it with the directory where you cloned this repository. Relay domains and tailnet names are examples too; use your own.
+
 ## 1. Run the relay
 
-On your server:
+For **interactive configuration**, first load the extension and run `/remote setup` as described in [step 2](#2-load-the-extension-on-your-computer). The relay need not be running yet. Copy its printed `export PI_REMOTE_TOKEN=...` command into the relay's environment, then start the relay. **Do not generate a different token on the server.**
+
+For **manual configuration**, on your server:
 
 ```sh
-cd /home/solopie/repos/pi-remote
+cd /path/to/pi-remote
 npm ci
 
-# Generate this once, save it securely, and use the SAME token on the pi machine.
+# Manual setup only: generate once and use the SAME token on the pi machine.
+# With /remote setup, use its printed export command instead of this next line.
 export PI_REMOTE_TOKEN="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
 npm start
 ```
 
 The relay binds to `127.0.0.1:8787`. Environment variables are read from the process; `.env` is **not automatically loaded**. Node supports `node --env-file=.env src/server.js` if you prefer a file. See `.env.example`.
+
+Choose one of the following HTTPS setups. **Tailscale Serve is recommended for private access; it does not require Caddy.** Both options proxy the website and WebSocket connections to the local relay.
+
+### Option A: Private HTTPS with Tailscale Serve
+
+1. Install Tailscale and sign in on the relay machine, the pi computer (if separate), and your phone. Connect all of them to the same tailnet. Your tailnet's ACLs/grants must allow the pi computer and phone to reach the relay machine on TCP port 443.
+2. Enable **MagicDNS** and **HTTPS certificates** in the tailnet's DNS settings, or follow the HTTPS enablement link if `tailscale serve` prompts you. See [Tailscale's HTTPS setup](https://tailscale.com/kb/1153/enabling-https). Certificate transparency logs expose the machine's `.ts.net` name, so choose a non-sensitive machine name.
+3. Keep the Node relay running on `127.0.0.1:8787`. On the relay machine, in another terminal, run:
+
+   ```sh
+   sudo tailscale serve --bg http://127.0.0.1:8787
+   sudo tailscale serve status
+   ```
+
+   You can configure Serve before starting the Node relay if you need its URL for `/remote setup`. Serve terminates HTTPS and forwards WebSocket upgrades automatically. Use the **root URL** it reports, for example `https://relay-host.example-tailnet.ts.net`, as `PI_REMOTE_URL` on the pi computer when [loading the extension](#2-load-the-extension-on-your-computer). Do not append `/ws`, use port 8787 in that URL, or serve the app under a subpath.
+4. Keep Tailscale connected on your phone when [opening the private pairing link](#3-connect-your-phone). Use **Serve**, not **Funnel**: Serve is tailnet-only, whereas Funnel exposes the endpoint to the public internet. Tailnet access is an additional layer: hosts still need the relay token, and phones still need the private pairing link.
+
+Leave `PI_REMOTE_TRUSTED_PROXIES` **unset or empty** for this option, and restart the relay if you previously set it for Caddy. Serve supplies `X-Forwarded-For`, which this relay does not use for admission quotas; it does not provide the required overwriting `X-Real-IP` header. Quotas therefore remain shared by users connecting through Serve. Do not copy the Caddy trusted-proxy setting below into this setup.
+
+`--bg` keeps Serve configured in the Tailscale daemon; it does **not** keep the Node relay process running. Run the relay separately (for example, as a systemd service) if it should survive terminal closure or reboot. No public port forwarding is needed, and port 8787 should remain private.
+
+**NixOS:** enable Tailscale declaratively in your NixOS configuration and rebuild it:
+
+```nix
+services.tailscale.enable = true;
+```
+
+Then run `sudo tailscale up` if the machine is not already signed in. The Tailscale package lives in `/nix/store` and its daemon is managed by NixOS; no separate Caddy binary or Nix profile is needed for Serve. This enables Tailscale, not the pi-remote Node service.
+
+### Option B: HTTPS with Caddy
 
 Put a TLS reverse proxy in front of the relay. Example Caddy configuration (replace the domain):
 
@@ -52,9 +88,9 @@ pi.example.com {
 
 For this same-machine proxy, set `PI_REMOTE_TRUSTED_PROXIES=127.0.0.1` before starting the relay (restart an existing relay). This makes admission quotas per client rather than shared by all proxy users. The setting is a comma-separated list of **exact TCP peer IP addresses**, not CIDRs. For containers or other proxy arrangements, use the actual proxy peer address seen by the relay. Leave it unset for direct connections. Trusted proxies must overwrite `X-Real-IP` with a single valid client IP; missing or malformed values are rejected. Keep the backend private and trust only proxies you control.
 
-Caddy automatically supports WebSocket upgrades. Use an HTTPS URL, keep port 8787 private, and do not log WebSocket payloads. For private access you can instead use a properly configured Tailscale HTTPS endpoint. A VPN is recommended for an initial deployment.
+Caddy automatically supports WebSocket upgrades. Use an HTTPS URL, keep port 8787 private, and do not log WebSocket payloads. A VPN is recommended for an initial deployment.
 
-Optional container:
+### Optional container (either HTTPS option)
 
 ```sh
 docker build -t pi-remote .
@@ -66,23 +102,52 @@ The server token authorizes **pi hosts**, not phones. Never include it in a pair
 ## 2. Load the extension on your computer
 
 ```sh
-cd /home/solopie/repos/pi-remote
+cd /path/to/pi-remote
 npm ci
-export PI_REMOTE_URL=https://pi.example.com
-export PI_REMOTE_TOKEN='the-same-server-token'
+# Interactive setup does not require PI_REMOTE_URL/PI_REMOTE_TOKEN beforehand.
 
 # Temporary extension, preserving your normal pi configuration:
 cd /path/to/your/project
-pi -e /home/solopie/repos/pi-remote/extension/remote.ts
+pi -e /path/to/pi-remote/extension/remote.ts
 ```
 
 For permanent installation, use pi's local-package installer:
 
 ```sh
-pi install /home/solopie/repos/pi-remote
+pi install /path/to/pi-remote
 ```
 
-Then start pi with the two environment variables set. Installing is optional; this project does not change your pi settings automatically.
+Installing is optional. It loads the extension but does not configure or enable remote access.
+
+### Interactive configuration: `/remote setup`
+
+In the pi terminal:
+
+1. Run `/remote setup` and enter the **root relay URL**, such as the actual `https://relay-host.example-tailnet.ts.net` URL printed by `tailscale serve status`, or your Caddy domain. HTTPS is required except for localhost development. If a valid URL is already configured, Enter keeps it; Escape cancels without changing settings.
+2. Setup generates a fresh **43-character passphrase with 256 bits of cryptographic randomness** for `PI_REMOTE_TOKEN`. Copy the printed `export PI_REMOTE_TOKEN='...'` command to the **relay machine**, or place that value in the relay's private environment file. Keep it secret.
+3. Start/restart the relay with that token. Setup does **not** change the relay's configuration, manage Tailscale/Caddy, or enable remote access automatically.
+4. Run `/remote` to enable access, then follow [step 3](#3-connect-your-phone) to pair your phone.
+
+The URL and token are saved to `~/.pi/agent/pi-remote.json` (or the directory selected by `PI_CODING_AGENT_DIR`). The file is written atomically with mode `0600` on Unix, and `/remote` loads it automatically. Setup also applies the values to the current pi process, so no pi restart is needed; your parent shell is unchanged. This is a dedicated extension file, not a modification to pi's main settings or session transcript. Pairing encryption keys are separate and are never stored there.
+
+Explicit `PI_REMOTE_URL` and `PI_REMOTE_TOKEN` environment variables take precedence over saved settings on later launches. Update or unset old overrides **in the shell that launches pi**, not the relay's environment. To override a saved URL with a different relay, supply its token too; saved tokens are not sent to another relay.
+
+Run `/remote off` before re-running setup. Replacing existing settings requires confirmation and generates a **new token**: update the relay and any other pi hosts that share it. `/remote off`, session changes, or shutdown cancel a pending setup dialog. Setup requires an interactive UI; non-interactive clients can use the environment variables below instead.
+
+### Manual configuration (optional)
+
+Before starting pi, set both variables instead of using the setup wizard:
+
+```sh
+# Replace with the root HTTPS URL from your chosen setup above.
+# Tailscale Serve: the actual .ts.net URL printed by `tailscale serve status`.
+# Caddy: your configured domain, e.g. https://pi.example.com.
+export PI_REMOTE_URL=https://relay-host.example-tailnet.ts.net
+export PI_REMOTE_TOKEN='the-same-server-token'
+pi -e /path/to/pi-remote/extension/remote.ts
+```
+
+The relay and extension must use the same token, whether it was generated by setup or manually.
 
 ## 3. Connect your phone
 
@@ -110,11 +175,13 @@ For a localhost-only smoke test, set `PI_REMOTE_URL=http://localhost:8787` and o
 
 **A pairing link grants agent control, which can amount to shell access. Treat it like a password.** Do not share it in screenshots, tickets, or public messages.
 
+The setup file contains a plaintext relay token protected by user-only file permissions. Keep it, the generated-token notification, and any relay environment file private; do not commit them to a repository or embed secrets in Nix configuration that puts them in the world-readable `/nix/store`. Setup uses terminal UI only: it does not add credentials to model messages, the session transcript, or phone snapshots.
+
 The relay routes encrypted snapshots, acknowledgements, and commands. It can see room identifiers, connection timing, and ciphertext sizes, but does not receive the encryption key. Host and client packets use different authenticated encryption contexts to prevent reflection. Protocol v2 also authenticates each packet type (`state`, `ack`, or `command`), preventing relabelling attacks. The client validates snapshot/acknowledgement schemas before changing its revision or UI, and uses text rendering, not unsafe HTML.
 
 However, this is an MVP, not a security-audited product. The web client is delivered by the relay: a compromised relay could serve malicious JavaScript that steals a pairing key. Use a server you trust. A future signed native client would strengthen this boundary. Local extensions can also observe user input through normal pi hooks.
 
-The relay enforces payload, connection, room, client, and per-connection message limits, same-origin browser connections, and heartbeat checks. Upgrade admission also limits unauthenticated connections to 32 globally and 8 per TCP peer, with at most 60 upgrades per minute per peer and a bounded 1,000-peer tracking table. Unauthenticated connections are terminated after five seconds. Behind a reverse proxy, configure `PI_REMOTE_TRUSTED_PROXIES` and the overwriting `X-Real-IP` header as shown above to isolate client quotas; otherwise these peer quotas remain shared by its users. Forwarded headers from untrusted TCP peers are ignored, including `X-Forwarded-For`. Configure client-IP connection and upgrade-rate limits at the proxy as well. These are basic safeguards, not a complete internet-facing abuse defense. Keep the relay behind a VPN initially; TLS remains required for the phone UI.
+The relay enforces payload, connection, room, client, and per-connection message limits, same-origin browser connections, and heartbeat checks. Upgrade admission also limits unauthenticated connections to 32 globally and 8 per TCP peer, with at most 60 upgrades per minute per peer and a bounded 1,000-peer tracking table. Unauthenticated connections are terminated after five seconds. For the Caddy option, configure `PI_REMOTE_TRUSTED_PROXIES` and the overwriting `X-Real-IP` header as shown above to isolate client quotas. For Tailscale Serve, leave `PI_REMOTE_TRUSTED_PROXIES` unset or empty; peer quotas remain shared by its users. Forwarded headers from untrusted TCP peers are ignored, including `X-Forwarded-For`. Configure client-IP connection and upgrade-rate limits at the proxy where supported. These are basic safeguards, not a complete internet-facing abuse defense. Keep the relay behind a VPN initially; TLS remains required for the phone UI.
 
 `/remote off` immediately stops the extension accepting commands. If the relay is connected, its room is deleted. If it is unreachable, a cached encrypted snapshot may remain accessible to someone with the old link until the room expires; it cannot control the disabled agent.
 
@@ -124,7 +191,7 @@ The relay enforces payload, connection, room, client, and per-connection message
 npm run check  # TypeScript checks and Node tests; no model calls
 ```
 
-Tests exercise Node/browser cryptography interoperability, transcript filtering, relay authentication/routing/reconnect/replay/revocation, extension prompt/interrupt/deduplication behavior against a real relay with mocked pi APIs, same-document pairing and key-import races, and temporary capacity recovery. A real pi 1.1.0 SDK test verifies submission identity across delayed/transformed preflight and unrelated local turns using a synthetic stream (no model requests). The extension was also loaded through the real pi 1.1.0 RPC CLI, and a 390px-wide Chromium smoke check covered pairing, prompt submission, encrypted acknowledgement, layout, and disconnect.
+Tests exercise Node/browser cryptography interoperability, transcript filtering, relay authentication/routing/reconnect/replay/revocation, extension prompt/interrupt/deduplication behavior against a real relay with mocked pi APIs, same-document pairing and key-import races, temporary capacity recovery, and interactive setup (validation, token generation, private persistence, cancellation, and relay authentication). A real pi 1.1.0 SDK test verifies the setup UI and submission identity across delayed/transformed preflight and unrelated local turns using a synthetic stream (no model requests). Extension loading and setup were also verified through the real pi 1.1.0 RPC CLI (including URL retries, private persistence, and an empty transcript). A 390px-wide Chromium smoke check covered pairing, prompt submission, encrypted acknowledgement, layout, and disconnect.
 
 ### Protocol sketch
 

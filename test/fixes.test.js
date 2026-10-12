@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { AsyncLocalStorage, AsyncResource } from 'node:async_hooks';
 import { readFile } from 'node:fs/promises';
+import { join as pathJoin } from 'node:path';
 import vm from 'node:vm';
 import ts from 'typescript';
 import WebSocket from 'ws';
 import { createRelay } from '../src/server.js';
 import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot } from '../src/protocol.js';
+import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 
 async function extension(t, branch = []) {
   const timers = new Map(), sockets = [], events = new Map(), notices = [], statuses = [], prompts = [], starts = [];
@@ -47,8 +49,9 @@ async function extension(t, branch = []) {
   const source = ts.transpileModule(await readFile(new URL('../extension/remote.ts', import.meta.url), 'utf8'),
     { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
-  const context = vm.createContext({ pi, WebSocket: HostSocket, AsyncLocalStorage, URL, Buffer, process: { env: { PI_REMOTE_TOKEN: randomToken() } },
-    randomToken, seal, open, publicMessage, validCommand, boundSnapshot,
+  const context = vm.createContext({ pi, WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join: pathJoin,
+    getAgentDir: () => '/unused-pi-remote-test', process: { env: { PI_REMOTE_URL: 'http://localhost:8787', PI_REMOTE_TOKEN: randomToken() } },
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig,
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout });
   vm.runInContext(`${source}\nremoteExtension(pi);`, context);
   await handler('', ctx);

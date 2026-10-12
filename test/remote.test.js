@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { AsyncLocalStorage, AsyncResource } from 'node:async_hooks';
 import { readFile, writeFile, unlink } from 'node:fs/promises';
+import { join } from 'node:path';
 import ts from 'typescript';
 import vm from 'node:vm';
 import WebSocket from 'ws';
 import { createRelay } from '../src/server.js';
 import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot, MAX_SNAPSHOT_BYTES } from '../src/protocol.js';
+import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 
 const token = randomToken();
 async function relay(t, options = {}) {
@@ -268,8 +270,9 @@ test('snapshot publication bounds metadata and contains timer callback failures'
   const source = ts.transpileModule(await readFile(new URL('../extension/remote.ts', import.meta.url), 'utf8'),
     { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
-  const context = vm.createContext({ pi, WebSocket: HostSocket, AsyncLocalStorage, URL, Buffer,
-    process: { env: { PI_REMOTE_TOKEN: token } }, randomToken, seal, open, publicMessage, validCommand, boundSnapshot,
+  const context = vm.createContext({ pi, WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join,
+    getAgentDir: () => '/unused-pi-remote-test', process: { env: { PI_REMOTE_URL: 'http://localhost:8787', PI_REMOTE_TOKEN: token } },
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig,
     setTimeout: fn => { callback = fn; return 1; }, clearTimeout() {} });
   vm.runInContext(`${source}\nremoteExtension(pi);`, context);
   await handler('', ctx);

@@ -1,3 +1,6 @@
 node_modules/
 .env
 *.log
+# Private settings if PI_CODING_AGENT_DIR points into this checkout.
+pi-remote.json
+.pi-remote-*.tmp
