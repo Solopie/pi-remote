@@ -10,7 +10,7 @@ import ts from 'typescript';
 import WebSocket from 'ws';
 import { createRelay } from '../src/server.js';
 import { randomToken, seal, open } from '../src/crypto.js';
-import { publicMessage, validCommand, boundSnapshot } from '../src/protocol.js';
+import { publicMessage, validCommand, boundSnapshot, toolCallDetails } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
 
@@ -49,7 +49,7 @@ async function extension(t, { dir, env = {}, inputs = [], confirmations = [], ha
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
   const context = vm.createContext({ pi, WebSocket: Socket, AsyncLocalStorage, AbortController, URL, Buffer, Error, join,
     getAgentDir: () => dir, process: { env },
-    randomToken: () => { generated++; return randomToken(); }, seal, open, publicMessage, validCommand, boundSnapshot,
+    randomToken: () => { generated++; return randomToken(); }, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails,
     normalizeRelayURL, readConfig, saveConfig: save, resolveConfig, pairingMessage,
     setTimeout: (fn, ms) => { const id = ++nextTimer; timers.set(id, { fn, ms }); return id; },
     clearTimeout: id => timers.delete(id) });
@@ -322,6 +322,37 @@ test('a client imports the running relay token and authenticates without restart
   const room = new URLSearchParams(link.hash.slice(1)).get('room');
   assert.equal(app.rooms.get(room).host.readyState, WebSocket.OPEN);
   assert.equal(fresh.prompts.length, 0);
+});
+
+test('/remote trust requires confirmation, does not enable access, and can be revoked without restarting Pi', async t => {
+  const h = await extension(t, { env: { PI_REMOTE_URL: 'https://relay.example', PI_REMOTE_TOKEN: randomToken() }, confirmations: [true] });
+  await h.handler('trust');
+  assert.equal(h.env.PI_REMOTE_TRUST_RELAY, 'true'); assert.equal(h.sockets.length, 0); assert.deepEqual(h.prompts, []);
+  assert.match(h.dialogs[0].message, /receive.*pairing key/); assert.ok(!h.dialogs[0].message.includes(h.env.PI_REMOTE_TOKEN));
+  assert.equal(await readConfig(h.file), undefined);
+  await h.handler('on'); h.sockets[0].emit('open');
+  assert.equal(typeof h.sockets[0].sent[0].discovery.key, 'string');
+  await h.handler('untrust'); assert.equal(h.env.PI_REMOTE_TRUST_RELAY, 'true'); assert.match(h.notices.at(-1).text, /off/);
+  await h.handler('off'); await h.handler('untrust'); assert.equal(h.env.PI_REMOTE_TRUST_RELAY, 'false');
+  await h.handler('on'); h.sockets.at(-1).emit('open'); assert.equal(h.sockets.at(-1).sent[0].discovery, undefined);
+});
+
+test('cancelled or aborted relay trust confirmation does not share keys, and noninteractive trust fails closed', async t => {
+  const env = { PI_REMOTE_URL: 'https://relay.example', PI_REMOTE_TOKEN: randomToken() };
+  const declined = await extension(t, { env: { ...env }, confirmations: [false] }); await declined.handler('trust');
+  assert.equal(declined.env.PI_REMOTE_TRUST_RELAY, undefined);
+  const approval = deferred(), h = await extension(t, { env: { ...env }, confirmations: [approval.promise] });
+  const pending = h.handler('trust'); await new Promise(resolve => setImmediate(resolve));
+  await h.handler('off'); approval.resolve(true); await pending;
+  assert.equal(h.env.PI_REMOTE_TRUST_RELAY, undefined); assert.equal(h.sockets.length, 0);
+  const rpc = await extension(t, { env: { ...env }, hasUI: false }); await rpc.handler('trust');
+  assert.equal(rpc.env.PI_REMOTE_TRUST_RELAY, undefined); assert.match(rpc.notices.at(-1).text, /interactive UI/);
+});
+
+test('changing relay URL through setup clears the process trust flag', async t => {
+  const h = await extension(t, { env: { PI_REMOTE_URL: 'https://old.example', PI_REMOTE_TOKEN: randomToken(), PI_REMOTE_TRUST_RELAY: 'true' },
+    inputs: ['https://new.example', randomToken()], confirmations: [true] });
+  await h.handler('setup'); assert.equal(h.env.PI_REMOTE_TRUST_RELAY, 'false');
 });
 
 test('missing credentials suggest setup and usage includes the new subcommand', async t => {

@@ -1,6 +1,6 @@
 # Pi Remote
 
-Turn on `/remote` in an **existing pi session**, then control it from your phone. Your agent, tools, credentials, and repository stay on your computer. Both the computer and phone make outbound connections to a small relay.
+Turn on `/remote` in an **existing pi session**, then control it from your phone. Your agent, tools, model API credentials, and repository stay on your computer. Both the computer and phone make outbound connections to a small relay. Choose private QR pairing or Google-authenticated, trusted-relay session discovery.
 
 **MVP:** a pi 1.1.0 extension, Node WebSocket relay, and mobile-first web client. This is not a native iOS/Android app yet.
 
@@ -12,11 +12,13 @@ pi session → outbound WSS → relay ← WSS ← phone browser
 
 - `/remote` enables access; `/remote off` disables it and invalidates the active pairing on a connected relay.
 - `/remote setup` prompts for the relay URL and its existing token, then saves private local settings.
+- Optional Google SSO restricted to one verified email, with a connected-session dashboard and QR-free selection for explicitly enrolled Pi clients.
 - Locally generated terminal QR code and copyable private pairing link, with an end-to-end AES-256-GCM key in the URL fragment (not sent in HTTP requests).
-- Existing conversation, streamed assistant text, active tool names, expandable tool results.
+- Existing conversation, streamed assistant text, expandable provider-exposed thinking, tool inputs (including bash commands), active tool details, and expandable tool results.
+- On phones, the connected view fits the screen: only the chat scrolls, including live tool details, while the header and composer stay in place.
 - Send a prompt while idle; interrupt a running agent. Busy prompts are explicitly rejected, not silently queued.
 - Reconnect and latest-state replay; command IDs prevent duplicate execution during retries. Outbound host buffering is capped at 2 MB, and silent relay connections are terminated after 45 seconds.
-- No server-side repository access, model API keys, plaintext session storage, or command execution.
+- No relay-side repository access or model API keys. In trusted-dashboard mode, the relay holds session keys and can read/control enrolled sessions; Google login gates browser access.
 - Visible terminal status while remote access is enabled.
 
 ## Requirements
@@ -41,7 +43,7 @@ When `PI_REMOTE_TOKEN` is **unset**, the relay generates a **43-character, 256-b
 
 An automatically generated token is kept in process memory, so restarting the relay generates a **new token**. To keep the same relay-issued token across restarts, set `PI_REMOTE_TOKEN` to that value in the relay's private environment or environment file. Explicitly configured tokens must be at least 32 characters and are not printed at startup. Keep startup output and service logs private, since automatically generated credentials appear there.
 
-The relay binds to `127.0.0.1:8787`. Environment variables are read from the process; `.env` is **not automatically loaded**. Node supports `node --env-file=.env src/server.js` if you prefer a file. See `.env.example`.
+The relay binds to `127.0.0.1:8787`. **`npm start` automatically loads `.env` from this checkout if it exists**, using Node’s `--env-file-if-exists` option. Explicit process environment variables take precedence over file values. Missing `.env` is allowed. Direct `node src/server.js` does not load a file; use `node --env-file=.env src/server.js` to require one explicitly. Keep `.env` private (`chmod 600 .env`); see `.env.example`.
 
 Choose one of the following HTTPS setups. **Tailscale Serve is recommended for private access; it does not require Caddy.** Both options proxy the website and WebSocket connections to the local relay.
 
@@ -96,6 +98,47 @@ docker run --rm -e PI_REMOTE_TOKEN -p 127.0.0.1:8787:8787 pi-remote
 ```
 
 The server token authorizes **pi hosts**, not phones. Never include it in a pairing link. Rotating it requires restarting the relay and updating your pi environment.
+
+## Optional: Google login and trusted session dashboard
+
+Without Google configuration the existing private-link, opaque-transport mode remains available. If any Google variable is present, **all four are required**; incomplete configuration prevents startup rather than opening unauthenticated access. With Google configured, **every browser/client connection requires login**, even when using a pairing link. Pi hosts continue to use `PI_REMOTE_TOKEN` and do not need Google credentials.
+
+1. In Google Auth Platform, create a **Web application** OAuth client. For an External app in Testing, add your account as a test user. Only `openid` and `email` scopes are used. Testing-user configuration is not the security allowlist: the relay independently verifies the signed ID token, issuer, audience, expiration, nonce, `email_verified`, and exact configured email.
+2. Register this exact authorized redirect URI, substituting your real HTTPS origin:
+   `https://relay-host.your-tailnet.ts.net/auth/google/callback`.
+   No JavaScript origin is needed. Google redirects your browser; a private Tailscale Serve URL works without exposing the relay through Funnel. Both the browser and relay need access to Google. If Google's domain rules reject your hostname, use an HTTPS hostname on a domain you own.
+3. Add these settings to private `.env` (already Git-ignored) or a private runtime environment file:
+
+   ```dotenv
+   PI_REMOTE_GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+   PI_REMOTE_GOOGLE_CLIENT_SECRET=your-client-secret
+   PI_REMOTE_ALLOWED_EMAIL=owner@example.com
+   PI_REMOTE_PUBLIC_URL=https://relay-host.your-tailnet.ts.net
+   ```
+
+   `chmod 600 .env`. Use your real email only in private configuration, not committed examples. Keep OAuth secrets out of Nix expressions and `/nix/store`; use a runtime environment file. `PI_REMOTE_PUBLIC_URL` must be the externally visible HTTPS root origin, not the backend HTTP listener. Loopback HTTP is supported only for development. No arbitrary forwarded headers are used to construct OAuth redirects.
+4. Preserve the same relay-issued `PI_REMOTE_TOKEN` if you want existing Pi clients to reconnect. When you are ready to deploy, stop the old relay and start **one** replacement with `npm start`. It loads the checkout’s `.env` automatically; use `node --env-file=/path/to/private/relay.env src/server.js` for a different runtime file. Automatic host tokens rotate on restart if you do not persist one. Do not restart a running relay until you are ready to apply the configuration.
+5. In an existing interactive Pi process, load the updated extension and opt in without restarting Pi:
+
+   ```text
+   /remote off
+   /reload
+   /remote trust
+   /remote
+   ```
+
+   Confirm the explicit key-sharing warning. This applies to the current Pi process, including `/reload`, but is not written to disk. `/remote off` followed by `/remote untrust` disables discovery for that process. Changing the relay URL through `/remote setup` clears this process's trust flag.
+
+   For **future Pi launches**, set the explicit environment opt-in:
+
+   ```sh
+   PI_REMOTE_TRUST_RELAY=true pi -e /path/to/pi-remote/extension/remote.ts
+   ```
+
+   Use existing saved `/remote setup` settings or supply the relay URL/token as before. Resume an existing Pi session if needed. The flag must be in **Pi's environment**, not only the relay's `.env`; changing a parent shell after Pi started does not change Pi's environment. Reloading extension code alone cannot set this flag; use `/remote trust` interactively or set it before launch. Run `/remote` in each desired session. Enrollment lasts only for that enabled pairing and is re-registered on reconnect; `/remote off` removes it. Session labels are captured at host connection time. Unenrolled connected hosts appear as “pairing required”; they can still be opened using their private link **after signing in**.
+6. Open the relay root page, sign in with the allowed Google account, and select a session. The dashboard refreshes every ten seconds and has a manual Refresh button. “Sessions” disconnects this browser and returns to the list without revoking Pi access. “Sign out” invalidates that login and closes its active client sockets. Login cookies are HttpOnly, SameSite=Lax, Secure on HTTPS, and expire after eight hours. OAuth transactions expire in five minutes; state/cookie binding, PKCE, and nonce checks protect the login flow. Logout requires same-origin POST with a session CSRF token.
+
+**Trust boundary:** `PI_REMOTE_TRUST_RELAY=true` sends the enabled session's pairing key and bounded label to the relay over WSS. The authenticated key endpoint lets your browser open it without a QR code. Snapshots/commands still use authenticated encryption, but this is **not end-to-end confidentiality against the relay**: a compromised relay can read/control enrolled sessions. Unenrolled hosts never send their keys. Dashboard lists, keys, OAuth transactions, and login sessions are memory-only; relay restart logs browsers out. Keys are not included in the session-list response, browser history, or application logs.
 
 ## 2. Load the extension on your computer
 
@@ -164,10 +207,10 @@ For a localhost-only smoke test, set `PI_REMOTE_URL=http://localhost:8787` and o
 
 - Pi is authoritative. Losing the relay/phone connection does not interrupt local work.
 - Computer sleep or pi exit makes the session unavailable; the relay does not keep your agent alive.
-- Latest snapshots contain up to **40 messages**, with **4,000 characters per message**. Snapshots also have a 600 KB UTF-8 JSON budget; older messages are omitted when necessary to stay below the encrypted transport limit. Session names and IDs are capped at 256 characters, and active tool names at 100 entries of 128 characters each. Snapshot failures are contained and shown in the terminal status instead of crashing pi. Thinking, images, raw tool arguments, and custom messages are omitted. Public tool output can still contain sensitive information.
+- Latest snapshots contain up to **40 messages**, with **4,000 characters per message**. Snapshots also have a 600 KB UTF-8 JSON budget; older messages are omitted when necessary to stay below the encrypted transport limit. Provider-exposed thinking text is capped at 4,000 characters per message; up to 20 tool calls per message carry inputs capped at 4,000 characters each. Thinking starts collapsed, and tool inputs start expanded. Live tool inputs appear while executing, including nested tool calls emitted by Pi; completed top-level calls remain in the conversation. Session names and IDs are capped at 256 characters, active tool names at 100 entries of 128 characters each, and live tool details at 20 entries. Snapshot failures are contained and shown in the terminal status instead of crashing pi. Images, provider signatures, safety-redacted thinking, and custom messages are omitted. Thinking is available only when the provider exposes it; opaque reasoning payloads are never decoded or forwarded. Tool inputs, thinking, and tool output can contain sensitive information.
 - There is no durable relay database. Disconnected rooms expire after approximately five minutes. With a stable, explicitly configured relay token, a restarted relay is repopulated by reconnecting pi hosts; if a phone reconnects first, reopen its link once pi is connected. With automatic startup tokens, update each Pi client's token after a relay restart and re-enable `/remote`. Stale host connections and temporary room/client capacity limits cause retryable `1013` closes, not revocation; hosts and phones retain their pairing and retry as capacity becomes available. Invalid authentication still produces a terminal `1008` rejection.
 - Commands expire after two minutes and are deduplicated for the active pairing. After 10,000 commands, start a fresh pairing. A successful prompt acknowledgement is sent when that submission's own agent turn starts, not when the task completes. Its asynchronous invocation context is tracked, so unrelated local turns cannot acknowledge it. Pi’s fire-and-forget submission API does not expose asynchronous preflight errors or cancellation. While submission is pending, the phone disables **Stop agent** and the host explicitly rejects interrupt requests; an idle abort cannot cancel preflight. If no correlated turn starts within 15 seconds, the phone receives an unknown-outcome warning. The submission identity and lock remain until that submission's turn starts or remote access is disabled, preventing an unrelated or late start from acknowledging a newer prompt. Check pi before restarting `/remote` or resending: a delayed submission may still execute. Retries of the same command ID never submit it again.
-- No follow-up/steering queue, file browser, dedicated diff viewer, multi-session account dashboard, push notifications, or voice input yet.
+- No follow-up/steering queue, file browser, dedicated diff viewer, push notifications, or voice input yet.
 - Starting/switching/forking a pi session disables remote access; enable it again in the new session. Branch navigation rebuilds the transcript.
 - Remote input does not expand slash commands or prompt templates. It goes through pi's normal user-message API.
 
@@ -177,7 +220,9 @@ For a localhost-only smoke test, set `PI_REMOTE_URL=http://localhost:8787` and o
 
 The setup file contains a plaintext relay token protected by user-only file permissions. Keep it, the relay's generated-token startup output, and any relay environment file private; do not commit them to a repository or embed secrets in Nix configuration that puts them in the world-readable `/nix/store`. Setup uses terminal UI only: it does not add credentials to model messages, the session transcript, or phone snapshots.
 
-The relay routes encrypted snapshots, acknowledgements, and commands. It can see room identifiers, connection timing, and ciphertext sizes, but does not receive the encryption key. Host and client packets use different authenticated encryption contexts to prevent reflection. Protocol v2 also authenticates each packet type (`state`, `ack`, or `command`), preventing relabelling attacks. The client validates snapshot/acknowledgement schemas before changing its revision or UI, and uses text rendering, not unsafe HTML.
+Thinking and tool inputs are included only inside encrypted snapshots (end-to-end only for unenrolled hosts), never added to pairing URLs or relay logs. Treat the phone display as sensitive: commands, paths, file contents, and provider-exposed thinking may contain secrets.
+
+**Transport-only mode:** the relay routes encrypted snapshots, acknowledgements, and commands. It can see room identifiers, connection timing, and ciphertext sizes, but does not receive the encryption key. Host and client packets use different authenticated encryption contexts to prevent reflection. Protocol v2 also authenticates each packet type (`state`, `ack`, or `command`), preventing relabelling attacks. The client validates snapshot/acknowledgement schemas before changing its revision or UI, and uses text rendering, not unsafe HTML.
 
 However, this is an MVP, not a security-audited product. The web client is delivered by the relay: a compromised relay could serve malicious JavaScript that steals a pairing key. Use a server you trust. A future signed native client would strengthen this boundary. Local extensions can also observe user input through normal pi hooks.
 
@@ -191,7 +236,7 @@ The relay enforces payload, connection, room, client, and per-connection message
 npm run check  # TypeScript checks and Node tests; no model calls
 ```
 
-Tests exercise Node/browser cryptography interoperability, transcript filtering, relay authentication/routing/reconnect/replay/revocation, extension prompt/interrupt/deduplication behavior against a real relay with mocked pi APIs, same-document pairing and key-import races, temporary capacity recovery, QR decoding (including the complete private fragment, terminal themes, and narrow-width fallback), and interactive setup (relay-issued token input, validation, private persistence, cancellation, and relay authentication), plus relay startup token generation, explicit overrides, and restart rotation. A real pi 1.1.0 SDK test verifies the setup UI and submission identity across delayed/transformed preflight and unrelated local turns using a synthetic stream (no model requests). Extension loading, setup, and QR pairing were also verified through the real pi 1.1.0 RPC CLI (including URL retries, private persistence, independently decoded QR payloads, relay authentication, and an empty transcript). A 390px-wide Chromium smoke check covered pairing, prompt submission, encrypted acknowledgement, layout, and disconnect.
+Tests exercise Google JWT verification, OAuth state/PKCE/nonce/cookie binding, email restrictions, dashboard key authorization, login expiration/logout/socket revocation, explicit Pi trust opt-in, authenticated browser selection, Node/browser cryptography interoperability, bounded thinking/tool-input projection and browser rendering, transcript filtering, relay authentication/routing/reconnect/replay/revocation, extension prompt/interrupt/deduplication behavior against a real relay with mocked pi APIs, same-document pairing and key-import races, temporary capacity recovery, QR decoding (including the complete private fragment, terminal themes, and narrow-width fallback), and interactive setup (relay-issued token input, validation, private persistence, cancellation, and relay authentication), plus relay startup token generation, explicit overrides, and restart rotation. A real pi 1.1.0 SDK test verifies the setup UI and submission identity across delayed/transformed preflight and unrelated local turns using a synthetic stream (no model requests). Extension loading, setup, and QR pairing were also verified through the real pi 1.1.0 RPC CLI (including URL retries, private persistence, independently decoded QR payloads, relay authentication, and an empty transcript). A 390px-wide Chromium smoke check covered pairing, prompt submission, encrypted acknowledgement, layout, and disconnect. Single-scroll connected layout was also checked in Chrome with long conversations and live tool inputs at phone, landscape, and keyboard-sized viewports. A separate 390px Chrome smoke check with a synthetic OAuth provider covered the login gate, authenticated dashboard, QR-free selection, encrypted prompt/acknowledgement, sign-out, and the connected single-scroll layout; real Google sign-in requires deployment credentials.
 
 ### Protocol sketch
 

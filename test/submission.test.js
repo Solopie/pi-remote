@@ -9,7 +9,7 @@ import ts from 'typescript';
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SettingsManager, SessionManager } from '@earendil-works/pi-coding-agent';
 import { getModel } from '@earendil-works/pi-ai/compat';
 import { randomToken, seal, open } from '../src/crypto.js';
-import { publicMessage, validCommand, boundSnapshot } from '../src/protocol.js';
+import { publicMessage, validCommand, boundSnapshot, toolCallDetails } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
 
@@ -31,7 +31,7 @@ test('Pi 1.1.0 supports interactive setup and preserves submission identity thro
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
   const context = vm.createContext({ WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join, setTimeout, clearTimeout,
     getAgentDir: () => dir, process: { env: {} },
-    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage });
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage });
   const remote = vm.runInContext(`${source}\nremoteExtension;`, context);
   let release, entered, settled, remoteReleased = false, remoteInputs = 0;
   const gate = new Promise(resolve => { release = resolve; });

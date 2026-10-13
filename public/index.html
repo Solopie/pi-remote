@@ -1,22 +1,27 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="theme-color" content="#10151e"><meta name="referrer" content="no-referrer">
   <title>Pi Remote</title><link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/style.css">
   <script type="module" src="/app.js"></script>
 </head>
 <body>
   <main>
-    <header><div><h1>π remote</h1><p id="session">Your coding agent, anywhere.</p></div><button id="disconnect" hidden>Disconnect</button></header>
+    <header><div><h1>π remote</h1><p id="session">Your coding agent, anywhere.</p></div><div id="auth-controls"><button id="disconnect" hidden>Sessions</button><button id="logout" hidden>Sign out</button></div></header>
+    <section id="login" hidden><h2>Sign in to Pi Remote</h2><p>Only the configured Google account can access remote sessions.</p><a class="button" href="/auth/google/start">Sign in with Google</a></section>
+    <section id="dashboard" hidden><h2>Remote sessions</h2><p id="account" class="muted"></p><p>Choose a connected Pi session.</p><div id="session-list"></div><button id="refresh-sessions">Refresh sessions</button></section>
     <section id="pair"><h2>Connect to your session</h2><p>Run <code>/remote</code> in pi, then scan its QR code with this phone's camera—or paste its private pairing link below.</p>
       <form id="pair-form"><label for="pair-link">Pairing link</label><input id="pair-link" type="password" autocomplete="off" placeholder="https://relay.example/#room=…&key=…" required><button>Connect</button></form>
       <p class="muted">Anyone with the link can control your agent. Run <code>/remote off</code> in pi to revoke access.</p>
     </section>
     <section id="workspace" hidden>
       <div class="statusbar"><span id="status" role="status">Connecting…</span><button id="interrupt" disabled>Stop agent</button></div>
-      <div id="messages" aria-label="Conversation"></div>
-      <p id="activity" class="muted"></p>
+      <div id="chat" role="region" aria-label="Conversation" tabindex="0">
+        <div id="messages"></div>
+        <p id="activity" class="muted"></p>
+        <div id="tool-calls" aria-label="Running tool inputs" hidden></div>
+      </div>
       <form id="prompt-form"><label for="prompt">Message your agent</label><textarea id="prompt" rows="3" maxlength="16000" placeholder="What should we work on?" required></textarea><div class="send-row"><span class="muted">Enter for newline · Ctrl/⌘ Enter to send</span><button id="send" disabled>Send</button></div></form>
     </section>
     <p id="notice" role="status"></p>

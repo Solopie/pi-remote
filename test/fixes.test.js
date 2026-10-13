@@ -9,11 +9,11 @@ import ts from 'typescript';
 import WebSocket from 'ws';
 import { createRelay } from '../src/server.js';
 import { randomToken, seal, open } from '../src/crypto.js';
-import { publicMessage, validCommand, boundSnapshot } from '../src/protocol.js';
+import { publicMessage, validCommand, boundSnapshot, toolCallDetails } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
 
-async function extension(t, branch = []) {
+async function extension(t, branch = [], trustRelay = false) {
   const timers = new Map(), sockets = [], events = new Map(), notices = [], statuses = [], prompts = [], starts = [];
   let nextTimer = 0, handler, idle = true, interrupts = 0;
   const clock = {
@@ -51,8 +51,8 @@ async function extension(t, branch = []) {
     { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
   const context = vm.createContext({ pi, WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join: pathJoin,
-    getAgentDir: () => '/unused-pi-remote-test', process: { env: { PI_REMOTE_URL: 'http://localhost:8787', PI_REMOTE_TOKEN: randomToken() } },
-    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage,
+    getAgentDir: () => '/unused-pi-remote-test', process: { env: { PI_REMOTE_URL: 'http://localhost:8787', PI_REMOTE_TOKEN: randomToken(), PI_REMOTE_TRUST_RELAY: String(trustRelay) } },
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage,
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout });
   vm.runInContext(`${source}\nremoteExtension(pi);`, context);
   await handler('', ctx);
@@ -84,6 +84,60 @@ test('/remote displays a private QR and copyable link, reuses the pairing, and r
   assert.notEqual(next.split('\n').at(-1), original.split('\n').at(-1));
   assert.equal(next, pairingMessage(next.split('\n').at(-1)));
   assert.deepEqual(h.prompts, []);
+});
+
+test('Pi shares dashboard keys only with explicit trusted-relay opt-in', async t => {
+  const transport = await extension(t), trusted = await extension(t, [], true);
+  assert.equal(transport.sockets[0].sent[0].discovery, undefined);
+  assert.equal(trusted.sockets[0].sent[0].discovery.key, trusted.key);
+  assert.equal(trusted.sockets[0].sent[0].discovery.name, 'test');
+});
+
+test('thinking and tool inputs stream in encrypted snapshots and live tool details clear on completion', async t => {
+  const h = await extension(t), ws = h.sockets[0]; h.clock.run(150);
+  const message = { role: 'assistant', timestamp: 1, content: [] };
+  h.events.get('message_start')({ message }, h.ctx);
+  h.events.get('message_update')({ message: { ...message, content: [{ type: 'thinking', thinking: 'Inspecting files.' }] } });
+  h.clock.run(150);
+  const latest = () => open(h.key, ws.sent.filter(packet => packet.type === 'state').at(-1).payload, 'host', 'state');
+  assert.equal(latest().messages.at(-1).thinking, 'Inspecting files.');
+  const command = 'git diff --stat';
+  const complete = { ...message, content: [{ type: 'thinking', thinking: 'Inspecting files and changes.' },
+    { type: 'toolCall', name: 'bash', id: 'call-1', arguments: { command } }] };
+  h.events.get('message_update')({ message: complete });
+  h.events.get('tool_execution_start')({ toolCallId: 'call-1', toolName: 'bash', args: { command } });
+  h.clock.run(150);
+  assert.equal(latest().messages.length, 1); assert.equal(latest().messages[0].toolCalls[0].input, command);
+  assert.equal(latest().activeToolCalls[0].input, command); assert.equal(latest().activeToolCalls[0].id, 'call-1');
+  assert.ok(!JSON.stringify(ws.sent).includes(command)); assert.ok(!JSON.stringify(ws.sent).includes('Inspecting files'));
+  h.events.get('message_end')({ message: complete });
+  h.events.get('tool_execution_end')({ toolCallId: 'call-1' }); h.clock.run(150);
+  assert.equal(latest().activeToolCalls.length, 0); assert.equal(latest().messages[0].toolCalls[0].input, command);
+});
+
+test('saved-session thinking and tool commands appear in the initial encrypted snapshot', async t => {
+  const h = await extension(t, [{ type: 'message', message: { role: 'assistant', timestamp: 1, content: [
+    { type: 'thinking', thinking: 'Reviewing the changes.' },
+    { type: 'toolCall', name: 'bash', id: 'saved-call', arguments: { command: 'git diff --stat' } }
+  ] } }]);
+  h.clock.run(150);
+  const state = open(h.key, h.sockets[0].sent.find(packet => packet.type === 'state').payload, 'host', 'state');
+  assert.equal(state.messages[0].thinking, 'Reviewing the changes.');
+  assert.equal(state.messages[0].toolCalls[0].input, 'git diff --stat');
+});
+
+test('live tool detail limits fit the snapshot metadata byte budget even with JSON escaping', async t => {
+  const h = await extension(t); h.clock.run(150);
+  for (let i = 0; i < 120; i++) h.events.get('tool_execution_start')({
+    toolCallId: `${i}` + '\0'.repeat(10000), toolName: i < 20 ? 'bash' : '\0'.repeat(10000), args: { command: '\0'.repeat(10000) }
+  });
+  h.clock.run(150);
+  const states = h.sockets[0].sent.filter(packet => packet.type === 'state');
+  assert.equal(states.length, 2);
+  const state = open(h.key, states.at(-1).payload, 'host', 'state');
+  assert.equal(state.tools.length, 100); assert.equal(state.activeToolCalls.length, 20);
+  assert.equal(state.activeToolCalls[0].input.length, 4000); assert.equal(state.activeToolCalls[0].id.length, 128);
+  assert.ok(Buffer.byteLength(JSON.stringify(state)) <= 600000);
 });
 
 test('extension bounds stalled outbound buffering and republishes only latest state after reconnect', async t => {
@@ -234,15 +288,22 @@ test('late turns from a revoked pairing cannot acknowledge a new submission with
   assert.equal(h.clock.count(15000), 0);
 });
 
-async function browser({ importKey = (...args) => crypto.subtle.importKey(...args) } = {}) {
+async function browser({ importKey = (...args) => crypto.subtle.importKey(...args), visualViewport, fetch: fetchFn } = {}) {
   const elements = new Map(), listeners = new Map(), sockets = [], timers = new Map();
   let nextTimer = 0;
   const location = { hash: '', href: 'https://relay.test/', origin: 'https://relay.test', protocol: 'https:', host: 'relay.test' };
-  const element = id => {
-    if (!elements.has(id)) elements.set(id, { value: '', textContent: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0,
-      querySelectorAll: () => [], replaceChildren() {} });
-    return elements.get(id);
-  };
+  const createElement = tag => ({ tag, value: '', textContent: '', children: [], dataset: {}, open: false,
+    scrollHeight: 0, scrollTop: 0, clientHeight: 0,
+    append(...nodes) { for (const node of nodes) this.children.push(...(node.tag === 'fragment' ? node.children : [node])); },
+    replaceChildren(...nodes) { this.children = []; this.append(...nodes); },
+    querySelectorAll(selector) {
+      const result = [];
+      const visit = node => { if (node.tag === 'details' && (selector === 'details' || (selector === 'details[open]' && node.open))) result.push(node); for (const child of node.children) visit(child); };
+      for (const child of this.children) visit(child);
+      return result;
+    } });
+  const element = id => { if (!elements.has(id)) elements.set(id, createElement('div')); return elements.get(id); };
+  element('workspace').hidden = true;
   class BrowserSocket {
     static OPEN = 1; readyState = 1; sent = [];
     constructor() { sockets.push(this); }
@@ -251,7 +312,8 @@ async function browser({ importKey = (...args) => crypto.subtle.importKey(...arg
   }
   const key = randomToken(), cryptoKey = await crypto.subtle.importKey('raw', Buffer.from(key, 'base64url'), 'AES-GCM', false, ['encrypt', 'decrypt']);
   let decryptFinished;
-  const context = vm.createContext({ document: { getElementById: element, createDocumentFragment: () => ({ append() {} }), createElement: () => ({ append() {} }) },
+  const context = vm.createContext({ document: { getElementById: element, createDocumentFragment: () => createElement('fragment'), createElement,
+      documentElement: { style: { setProperty: (name, value) => { element('root-style')[name] = value; } } } }, visualViewport, fetch: fetchFn,
     TextEncoder, TextDecoder, atob, btoa, WebSocket: BrowserSocket, importedKey: cryptoKey, URL, URLSearchParams,
     crypto: { getRandomValues: array => crypto.getRandomValues(array), subtle: {
       importKey, encrypt: (...args) => crypto.subtle.encrypt(...args),
@@ -305,6 +367,12 @@ test('browser rejects malformed authenticated snapshots without changing revisio
     snapshot(11, { submitting: 'yes' }), snapshot(11, { tools: [null] }),
     snapshot(11, { messages: [{ role: 'assistant', text: {} }] }),
     snapshot(11, { messages: Array(41).fill({ role: 'user', text: 'x' }) }),
+    snapshot(11, { messages: [{ role: 'assistant', text: '', thinking: {} }] }),
+    snapshot(11, { messages: [{ role: 'assistant', text: '', thinking: 'x'.repeat(4001) }] }),
+    snapshot(11, { messages: [{ role: 'assistant', text: '', toolCalls: [{ name: 'bash', input: {} }] }] }),
+    snapshot(11, { activeToolCalls: [{ name: 'bash', input: 'x'.repeat(4001) }] }),
+    snapshot(11, { activeToolCalls: Array(21).fill({ name: 'bash', input: 'pwd' }) }),
+    snapshot(11, { activeToolCalls: [{ name: 'bash', input: 'pwd', id: {} }] }),
   ];
   for (const state of invalid) {
     await h.receive('state', state);
@@ -315,6 +383,87 @@ test('browser rejects malformed authenticated snapshots without changing revisio
   assert.equal(h.eval('pending.size'), 1);
   await h.receive('ack', { id: '12345678', ok: true });
   assert.equal(h.eval('pending.size'), 0);
+});
+
+test('phone renders thinking and actual tool inputs as text and preserves expansion across snapshots', async () => {
+  const h = await browser(), input = 'printf "<img src=x onerror=alert(1)>"';
+  const message = { role: 'assistant', timestamp: 1, text: 'Inspecting changes.', thinking: 'Checking the working tree.',
+    toolCalls: [{ id: 'call-1', name: 'bash', input }] };
+  await h.receive('state', snapshot(1, { messages: [message], tools: ['bash'], activeToolCalls: [{ id: 'call-1', name: 'bash', input }] }));
+  const details = h.element('messages').querySelectorAll('details');
+  assert.equal(details[0].children[0].textContent, 'Thinking'); assert.equal(details[0].open, false);
+  assert.equal(details[0].children[1].textContent, message.thinking);
+  assert.equal(details[1].children[1].textContent, input); assert.equal(details[1].open, true);
+  assert.equal(details[1].children[1].tag, 'pre');
+  assert.equal(h.element('tool-calls').querySelectorAll('details')[0].children[1].textContent, input);
+  details[0].open = true; details[1].open = false;
+  await h.receive('state', snapshot(2, { messages: [{ ...message, thinking: 'Checking more changes.' }], activeToolCalls: [] }));
+  const updated = h.element('messages').querySelectorAll('details');
+  assert.equal(updated[0].open, true); assert.equal(updated[1].open, false);
+  assert.equal(updated[0].children[1].textContent, 'Checking more changes.');
+  assert.equal(h.element('tool-calls').hidden, true);
+  h.eval('disconnect()'); assert.equal(h.element('messages').children.length, 0); assert.equal(h.element('tool-calls').children.length, 0);
+});
+
+test('chat scroll follows new snapshots only when the reader is near the bottom', async () => {
+  const h = await browser(), chat = h.element('chat');
+  chat.scrollHeight = 2000; chat.clientHeight = 500; chat.scrollTop = 200;
+  await h.receive('state', snapshot(1));
+  assert.equal(chat.scrollTop, 200);
+  chat.scrollTop = 1450;
+  await h.receive('state', snapshot(2));
+  assert.equal(chat.scrollTop, 2000);
+});
+
+test('connected layout height tracks the visual viewport when a mobile keyboard opens', async () => {
+  const listeners = new Map(), viewport = { height: 844, addEventListener: (name, fn) => listeners.set(name, fn) };
+  const h = await browser({ visualViewport: viewport });
+  assert.equal(h.element('root-style')['--app-height'], '844px');
+  viewport.height = 390; listeners.get('resize')();
+  assert.equal(h.element('root-style')['--app-height'], '390px');
+});
+
+test('dashboard requires login, renders names as text, and selects sessions without putting keys in the URL', async () => {
+  const room = randomToken(), key = randomToken(), calls = [];
+  const h = await browser({ fetch: async (path, options) => {
+    calls.push({ path, options });
+    return { ok: true, status: 200, json: async () => path === '/api/auth'
+      ? { enabled: true, authenticated: true, email: 'owner@example.com', csrf: 'csrf-token' }
+      : path === '/api/sessions' ? { sessions: [{ room, name: '<img src=x onerror=alert(1)>', connectable: true }] }
+      : path === '/auth/logout' ? { ok: true } : { room, key } };
+  } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.element('dashboard').hidden, false);
+  const button = h.element('session-list').children[0]; assert.equal(button.tag, 'button');
+  assert.equal(button.textContent, '<img src=x onerror=alert(1)>');
+  await button.onclick(); assert.equal(h.eval('credentials.room'), room);
+  assert.equal(h.element('workspace').hidden, false); assert.equal(h.element('dashboard').hidden, true);
+  assert.equal(h.location.hash, ''); assert.ok(!h.location.href.includes(key));
+  await h.element('logout').onclick();
+  assert.equal(h.element('login').hidden, false); assert.equal(h.element('workspace').hidden, true);
+  assert.equal(calls.at(-1).options.headers['X-CSRF-Token'], 'csrf-token');
+});
+
+test('unavailable authentication status fails closed, and unauthenticated Google mode cannot pair directly', async () => {
+  const failure = await browser({ fetch: async () => { throw Error('unavailable'); } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(failure.eval('authChecking'), true); assert.equal(failure.element('pair').hidden, true);
+  const h = await browser({ fetch: async () => ({ ok: true, json: async () => ({ enabled: true, authenticated: false }) }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.element('login').hidden, false); assert.equal(h.element('pair').hidden, true);
+  const before = h.sockets.length;
+  await h.navigate(`https://relay.test/#room=${randomToken()}&key=${randomToken()}`);
+  assert.equal(h.sockets.length, before); assert.equal(h.location.hash, '');
+});
+
+test('a sleeping phone with an expired login returns to sign-in after a failed upgrade', async () => {
+  let loggedIn = true;
+  const h = await browser({ fetch: async path => ({ ok: true, status: 200, json: async () => path === '/api/auth'
+    ? { enabled: true, authenticated: loggedIn, ...(loggedIn ? { email: 'owner@example.com', csrf: 'csrf' } : {}) }
+    : { sessions: [] } }) });
+  await new Promise(resolve => setImmediate(resolve)); loggedIn = false;
+  await h.sockets.at(-1).onclose({ code: 1006 });
+  assert.equal(h.element('login').hidden, false); assert.equal(h.eval('credentials'), undefined);
 });
 
 test('browser disables preflight interrupts, then enables them on an authoritative running snapshot', async () => {

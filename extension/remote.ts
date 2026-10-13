@@ -4,7 +4,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { join } from 'node:path';
 import WebSocket from 'ws';
 import { randomToken, seal, open } from '../src/crypto.js';
-import { publicMessage, validCommand, boundSnapshot } from '../src/protocol.js';
+import { publicMessage, validCommand, boundSnapshot, toolCallDetails } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
 
@@ -19,7 +19,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
   let enabled = false, socket: WebSocket | undefined, reconnect: ReturnType<typeof setTimeout> | undefined;
   let flush: ReturnType<typeof setTimeout> | undefined, retry = 0, room = '', key = '', link = '', relay = '', hostToken = '';
   let operation: AbortController | undefined;
-  let messages: Message[] = [], activeTools = new Map<string, string>();
+  let messages: Message[] = [], activeTools = new Map<string, ReturnType<typeof toolCallDetails>>();
   let revision = 0, submitting = false, streamingIndex = -1;
   let submission: Submission | undefined;
   const submissionContext = new AsyncLocalStorage<Submission>();
@@ -45,7 +45,9 @@ export default function remoteExtension(pi: ExtensionAPI) {
       try {
         transmit('state', { revision: ++revision, session: ctx.sessionManager.getSessionId().slice(0, 256),
           name: (pi.getSessionName() || ctx.cwd.split('/').pop() || 'Pi session').slice(0, 256),
-          busy: !!submission || submitting || !ctx.isIdle(), submitting: !!submission, tools: [...activeTools.values()].slice(0, 100).map(name => name.slice(0, 128)), messages });
+          busy: !!submission || submitting || !ctx.isIdle(), submitting: !!submission,
+          tools: [...activeTools.values()].slice(0, 100).map(tool => tool.name),
+          activeToolCalls: [...activeTools.entries()].slice(0, 20).map(([id, tool]) => ({ ...tool, id: id.slice(0, 128) })), messages });
       } catch {
         // Timer callbacks must never let snapshot/transport failures crash pi.
         status('Remote snapshot failed · /remote off to revoke');
@@ -66,7 +68,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
     socket = undefined;
     clearTimeout(submission?.timer); submission = undefined; submitting = false;
     submissionContext.disable();
-    commands.clear(); key = ''; room = ''; link = ''; hostToken = ''; status();
+    commands.clear(); activeTools.clear(); key = ''; room = ''; link = ''; hostToken = ''; status();
   }
   function connect() {
     if (!enabled) return;
@@ -81,7 +83,10 @@ export default function remoteExtension(pi: ExtensionAPI) {
     ws.on('open', () => {
       if (!enabled || socket !== ws) { ws.terminate(); return; }
       alive();
-      ws.send(JSON.stringify({ type: 'join', role: 'host', room, token: hostToken }));
+      // Sharing the pairing key deliberately changes this relay's trust boundary.
+      ws.send(JSON.stringify({ type: 'join', role: 'host', room, token: hostToken,
+        ...(process.env.PI_REMOTE_TRUST_RELAY === 'true' ? { discovery: { key,
+          name: (pi.getSessionName() || ctx.cwd.split('/').pop() || 'Pi session').slice(0, 256) } } : {}) }));
     });
     ws.on('message', raw => {
       if (!enabled || socket !== ws) return;
@@ -198,25 +203,37 @@ export default function remoteExtension(pi: ExtensionAPI) {
     if (signal.aborted) return;
     // Apply to this pi process immediately, including /reload. The parent shell
     // is unchanged; explicit environment variables override saved settings on restart.
+    if (suggested !== base) process.env.PI_REMOTE_TRUST_RELAY = 'false';
     process.env.PI_REMOTE_URL = base; process.env.PI_REMOTE_TOKEN = token;
     context.ui.notify(`Remote setup saved to ${file} (private, mode 0600).\nRelay URL: ${base}\nRelay-issued token saved (not displayed). Run /remote to enable access. Setup does not generate tokens, enable access, or reconfigure the relay.\nFor future pi launches, update or unset old PI_REMOTE_URL/PI_REMOTE_TOKEN shell overrides to use the saved settings.`, 'info');
   }
   pi.registerCommand('remote', {
-    description: 'Configure with /remote setup; /remote enables phone access; /remote off revokes it',
-    getArgumentCompletions: prefix => ['setup', 'on', 'off'].filter(value => value.startsWith(prefix)).map(value => ({ value, label: value })),
+    description: 'Configure with /remote setup; /remote trust enables the dashboard; /remote off revokes access',
+    getArgumentCompletions: prefix => ['setup', 'on', 'off', 'trust', 'untrust'].filter(value => value.startsWith(prefix)).map(value => ({ value, label: value })),
     handler: async (args, context) => {
       ctx = context;
       const action = args.trim();
       if (action === 'off') { stop(); context.ui.notify('Remote access disabled.', 'info'); return; }
-      if (!['', 'on', 'setup'].includes(action)) { context.ui.notify('Usage: /remote [setup|on|off]', 'warning'); return; }
-      if (action === 'setup' && enabled) { context.ui.notify('Run /remote off before setup so active access is not reconfigured.', 'warning'); return; }
+      if (!['', 'on', 'setup', 'trust', 'untrust'].includes(action)) { context.ui.notify('Usage: /remote [setup|on|off|trust|untrust]', 'warning'); return; }
+      if (['setup', 'trust', 'untrust'].includes(action) && enabled) { context.ui.notify('Run /remote off before setup or changing relay trust so active access is not reconfigured.', 'warning'); return; }
       if (enabled) { context.ui.notify(pairingMessage(link, process.stdout?.columns), 'info'); return; }
       if (operation) { context.ui.notify('Remote configuration is in progress. Finish it or run /remote off to cancel.', 'warning'); return; }
-      if (action === 'setup' && !context.hasUI) { context.ui.notify('/remote setup requires an interactive UI. Set PI_REMOTE_URL and PI_REMOTE_TOKEN instead.', 'error'); return; }
+      if (['setup', 'trust'].includes(action) && !context.hasUI) { context.ui.notify(`/remote ${action} requires an interactive UI. Set PI_REMOTE_URL/PI_REMOTE_TOKEN and PI_REMOTE_TRUST_RELAY explicitly instead.`, 'error'); return; }
       const controller = new AbortController(); operation = controller;
       try {
         const file = join(getAgentDir(), 'pi-remote.json');
         if (action === 'setup') { await setup(context, file, controller.signal); return; }
+        if (action === 'untrust') { process.env.PI_REMOTE_TRUST_RELAY = 'false'; context.ui.notify('Trusted dashboard disabled for this Pi process. Run /remote to use private pairing.', 'info'); return; }
+        if (action === 'trust') {
+          const config = await resolveConfig(file, process.env);
+          if (controller.signal.aborted) return;
+          const approved = await context.ui.confirm('Trust this relay with session access?',
+            `Allow ${config.url} to receive the enabled session's pairing key and name for QR-free dashboard access? The relay can read/control the session. Use only a trusted relay configured for Google login.`, { signal: controller.signal });
+          if (controller.signal.aborted) return;
+          if (!approved) { context.ui.notify('Relay trust unchanged.', 'info'); return; }
+          process.env.PI_REMOTE_TRUST_RELAY = 'true';
+          context.ui.notify('Trusted dashboard enabled for this Pi process (including /reload). Run /remote to enable access. For future Pi launches set PI_REMOTE_TRUST_RELAY=true; /remote untrust disables it.', 'info'); return;
+        }
         const config = await resolveConfig(file, process.env);
         if (controller.signal.aborted) return;
         const token = config.token;
@@ -229,6 +246,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
           .map(entry => publicMessage((entry as { message: unknown }).message)).filter((m): m is Message => !!m).slice(-40);
         activeTools.clear(); commands.clear(); revision = 0; retry = 0; submitting = false; streamingIndex = -1;
         enabled = true; status('Remote connecting… · /remote off'); connect();
+        if (process.env.PI_REMOTE_TRUST_RELAY === 'true') context.ui.notify('Trusted dashboard enabled: this relay receives the session key and can read/control the session. Use only a trusted relay.', 'warning');
         context.ui.notify(pairingMessage(link, process.stdout?.columns), 'info');
       } catch (error) {
         if (!controller.signal.aborted) context.ui.notify(`Remote ${action === 'setup' ? 'setup' : 'configuration'} failed: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error');
@@ -267,7 +285,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
   };
   pi.on('message_update', event => updateMessage(event.message));
   pi.on('message_end', event => { updateMessage(event.message); streamingIndex = -1; });
-  pi.on('tool_execution_start', event => { activeTools.set(event.toolCallId, event.toolName); publish(); });
+  pi.on('tool_execution_start', event => { if (!enabled) return; activeTools.set(event.toolCallId, toolCallDetails(event.toolName, event.args)); publish(); });
   pi.on('tool_execution_end', event => { activeTools.delete(event.toolCallId); publish(); });
   // Branch navigation changes the transcript; rebuild from the authoritative session.
   pi.on('session_tree', (_event, context) => {

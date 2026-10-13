@@ -9,7 +9,7 @@ import vm from 'node:vm';
 import WebSocket from 'ws';
 import { createRelay } from '../src/server.js';
 import { randomToken, seal, open } from '../src/crypto.js';
-import { publicMessage, validCommand, boundSnapshot, MAX_SNAPSHOT_BYTES } from '../src/protocol.js';
+import { publicMessage, validCommand, boundSnapshot, toolCallDetails, MAX_SNAPSHOT_BYTES } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
 
@@ -50,13 +50,43 @@ test('authenticated directional encryption interoperates with browser WebCrypto'
   assert.deepEqual(open(key, { iv: Buffer.from(iv).toString('base64url'), data: Buffer.from(data).toString('base64url') }, 'client', 'command'), value);
 });
 
-test('public transcript omits thinking, images and tool arguments, and bounds text', () => {
-  assert.deepEqual(publicMessage({ role: 'assistant', content: [{ type: 'thinking', thinking: 'secret' }, { type: 'image', data: 'secret' }, { type: 'toolCall', name: 'bash', arguments: { secret: 'key' } }, { type: 'text', text: 'Hi' }] }), { role: 'assistant', text: '[Tool: bash]\nHi', timestamp: undefined, tool: undefined });
+test('public transcript includes visible thinking and tool inputs, but omits images, signatures, and metadata', () => {
+  const message = publicMessage({ role: 'assistant', apiKey: 'private-metadata', content: [
+    { type: 'thinking', thinking: 'Checking the files.', thinkingSignature: 'private-signature' },
+    { type: 'thinking', thinking: 'redacted-payload', redacted: true, thinkingSignature: 'encrypted-payload' },
+    { type: 'image', data: 'private-image' },
+    { type: 'toolCall', name: 'bash', id: 'call-1', arguments: { command: 'git status --short' }, thoughtSignature: 'private-tool-signature' },
+    { type: 'text', text: 'Hi', textSignature: 'private-text-signature' }
+  ] });
+  assert.deepEqual(message, { role: 'assistant', text: '[Tool: bash]\nHi', timestamp: undefined, tool: undefined,
+    thinking: 'Checking the files.', toolCalls: [{ name: 'bash', id: 'call-1', input: 'git status --short' }] });
+  const serialized = JSON.stringify(message);
+  for (const hidden of ['private-metadata', 'private-signature', 'redacted-payload', 'encrypted-payload', 'private-image', 'private-tool-signature', 'private-text-signature']) {
+    assert.ok(!serialized.includes(hidden));
+  }
   assert.equal(publicMessage({ role: 'assistant', content: 'x'.repeat(13000) }).text.length, 4000);
   assert.equal(publicMessage({ role: 'custom', content: 'secret' }), null);
   assert.ok(validCommand({ id: '12345678', action: 'prompt', text: 'Hi' }));
   assert.ok(!validCommand({ id: '12345678', action: 'prompt', text: ' ' }));
   assert.ok(!validCommand({ id: '12345678', action: 'exec', text: 'Hi' }));
+});
+
+test('thinking-only messages and tool inputs remain bounded, including cyclic and oversized arguments', () => {
+  const message = publicMessage({ role: 'assistant', content: [null, { type: 'thinking', thinking: 'x'.repeat(10000) }] });
+  assert.equal(message.text, ''); assert.equal(message.thinking.length, 4000);
+  assert.equal(publicMessage({ role: 'assistant', content: [{ type: 'thinking', thinking: 'hidden', redacted: true }] }), null);
+  const calls = publicMessage({ role: 'assistant', content: Array.from({ length: 100 }, () => ({ type: 'toolCall',
+    name: 'bash', id: 'x'.repeat(10000), arguments: { command: 'x'.repeat(10000) } })) });
+  assert.equal(calls.toolCalls.length, 20); assert.equal(calls.toolCalls[0].input.length, 4000); assert.equal(calls.toolCalls[0].id.length, 128);
+  assert.equal(calls.text.length <= 4000, true);
+  const args = { path: 'file.txt', content: 'x'.repeat(100000) }; args.circular = args;
+  const tool = toolCallDetails('write', args);
+  assert.ok(tool.input.includes('file.txt')); assert.ok(tool.input.length <= 4000);
+  const circular = {}; circular.self = circular;
+  assert.match(toolCallDetails('custom', circular).input, /Circular/);
+  assert.ok(toolCallDetails('custom', { large: 1n }).input.length <= 4000);
+  assert.equal(toolCallDetails('x'.repeat(10000), {}).name.length, 128);
+  assert.equal(toolCallDetails('bash', { get command() { throw Error('private-error'); } }).input, '[Tool input unavailable]');
 });
 
 test('relay routes opaque state/commands, replays snapshots, isolates rooms, and revokes', async t => {
@@ -273,7 +303,7 @@ test('snapshot publication bounds metadata and contains timer callback failures'
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
   const context = vm.createContext({ pi, WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join,
     getAgentDir: () => '/unused-pi-remote-test', process: { env: { PI_REMOTE_URL: 'http://localhost:8787', PI_REMOTE_TOKEN: token } },
-    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage,
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage,
     setTimeout: fn => { callback = fn; return 1; }, clearTimeout() {} });
   vm.runInContext(`${source}\nremoteExtension(pi);`, context);
   await handler('', ctx);

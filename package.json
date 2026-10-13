@@ -1,8 +1,8 @@
 {
   "name": "pi-remote", "version": "0.1.0", "private": true, "type": "module",
   "description": "Control an existing pi coding agent session from your phone through an encrypted relay",
-  "scripts": {"start": "node src/server.js", "test": "node --test", "typecheck": "tsc --noEmit", "check": "npm run typecheck && npm test"},
+  "scripts": {"start": "node --env-file-if-exists=.env src/server.js", "test": "node --test", "typecheck": "tsc --noEmit", "check": "npm run typecheck && npm test"},
   "pi": {"extensions": ["./extension/remote.ts"]},
-  "dependencies": {"qrcode": "^1.5.4", "ws": "^8.18.3"},
+  "dependencies": {"jose": "^6.2.12", "qrcode": "^1.5.4", "ws": "^8.18.3"},
   "devDependencies": {"@earendil-works/pi-coding-agent": "1.1.0", "@types/node": "^24.0.0", "@types/qrcode": "^1.5.6", "@types/ws": "^8.18.1", "jsqr": "^1.4.0", "typescript": "^5.9.3"}
 }
