@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
+import { randomToken } from './crypto.js';
 import { WebSocketServer, WebSocket } from 'ws';
 
 const ROOM_ID = /^[A-Za-z0-9_-]{43}$/;
@@ -153,8 +154,16 @@ export function createRelay({ token, roomTTL = 300000, maxRooms = 100, maxConnec
   } };
 }
 if (process.argv[1] && fileURLToPath(import.meta.url) === fileURLToPath(new URL(`file://${process.argv[1]}`))) {
-  const relay = createRelay({ token: process.env.PI_REMOTE_TOKEN,
+  const generated = process.env.PI_REMOTE_TOKEN === undefined;
+  const token = generated ? randomToken() : process.env.PI_REMOTE_TOKEN;
+  const relay = createRelay({ token,
     trustedProxies: (process.env.PI_REMOTE_TRUSTED_PROXIES || '').split(',').map(ip => ip.trim()).filter(Boolean) });
   const port = Number(process.env.PORT || 8787), host = process.env.HOST || '127.0.0.1';
-  relay.server.listen(port, host, () => console.log(`pi-remote relay listening on http://${host}:${port}`));
+  relay.server.listen(port, host, () => {
+    const address = relay.server.address();
+    const boundPort = address && typeof address === 'object' ? address.port : port;
+    const hostname = host.includes(':') ? `[${host}]` : host;
+    console.log(`pi-remote relay listening on http://${hostname}:${boundPort}`);
+    if (generated) console.log(`Generated relay token — keep private:\nPI_REMOTE_TOKEN=${token}\nPaste this token into /remote setup on each Pi client.\nA new token is generated on each restart unless PI_REMOTE_TOKEN is explicitly configured.`);
+  });
 }

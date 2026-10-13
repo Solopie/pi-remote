@@ -174,17 +174,32 @@ export default function remoteExtension(pi: ExtensionAPI) {
     }
     if (saved || unreadable || process.env.PI_REMOTE_TOKEN) {
       const approved = await context.ui.confirm('Replace remote settings?',
-        'A new relay token will be generated. Update PI_REMOTE_TOKEN on the relay and restart it; other pi hosts using that relay must also use the new token. Replace these settings?', { signal });
+        'Replace this Pi client\'s saved relay settings? This does not change the token on the relay or other Pi clients.', { signal });
       if (signal.aborted) return;
       if (!approved) { context.ui.notify('Remote setup cancelled. Settings unchanged.', 'info'); return; }
     }
-    const token = randomToken(); // 256 bits of cryptographic randomness, independent of pairing keys.
+    // Only reuse a credential for the URL it was configured for; never send a
+    // saved token to a different relay just because its URL was changed.
+    const previousToken = process.env.PI_REMOTE_TOKEN
+      ? (suggested === base ? process.env.PI_REMOTE_TOKEN : undefined)
+      : (saved?.url === base ? saved.token : undefined);
+    const canKeepToken = previousToken && previousToken.length >= 32;
+    let token: string;
+    while (true) {
+      const input = await context.ui.input(`Relay token (paste the token value from the relay startup output${canKeepToken ? '; Enter keeps the existing token' : ''})`,
+        'Relay-issued token; keep private', { signal });
+      if (signal.aborted) return;
+      if (input === undefined) { context.ui.notify('Remote setup cancelled. Settings unchanged.', 'info'); return; }
+      const candidate = input.trim() || (canKeepToken ? previousToken : undefined);
+      if (candidate && candidate.length >= 32) { token = candidate; break; }
+      context.ui.notify('Paste the relay-issued token (at least 32 characters). Setup does not generate tokens.', 'error');
+    }
     await saveConfig(file, { url: base, token }, signal);
     if (signal.aborted) return;
     // Apply to this pi process immediately, including /reload. The parent shell
     // is unchanged; explicit environment variables override saved settings on restart.
     process.env.PI_REMOTE_URL = base; process.env.PI_REMOTE_TOKEN = token;
-    context.ui.notify(`Remote setup saved to ${file} (private, mode 0600).\nRelay URL: ${base}\n\nGenerated passphrase — keep private. Set this on the relay:\nexport PI_REMOTE_TOKEN='${token}'\n\nStart/restart the relay with that token, then run /remote to enable access. Setup does not enable access or reconfigure the relay.\nFor future pi launches, update or unset old PI_REMOTE_URL/PI_REMOTE_TOKEN shell overrides to use the saved settings.`, 'info');
+    context.ui.notify(`Remote setup saved to ${file} (private, mode 0600).\nRelay URL: ${base}\nRelay-issued token saved (not displayed). Run /remote to enable access. Setup does not generate tokens, enable access, or reconfigure the relay.\nFor future pi launches, update or unset old PI_REMOTE_URL/PI_REMOTE_TOKEN shell overrides to use the saved settings.`, 'info');
   }
   pi.registerCommand('remote', {
     description: 'Configure with /remote setup; /remote enables phone access; /remote off revokes it',

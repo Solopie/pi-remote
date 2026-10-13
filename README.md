@@ -11,7 +11,7 @@ pi session → outbound WSS → relay ← WSS ← phone browser
 ## Features
 
 - `/remote` enables access; `/remote off` disables it and invalidates the active pairing on a connected relay.
-- `/remote setup` prompts for the relay URL, generates a strong random token, and saves private local settings.
+- `/remote setup` prompts for the relay URL and its existing token, then saves private local settings.
 - Locally generated terminal QR code and copyable private pairing link, with an end-to-end AES-256-GCM key in the URL fragment (not sent in HTTP requests).
 - Existing conversation, streamed assistant text, active tool names, expandable tool results.
 - Send a prompt while idle; interrupt a running agent. Busy prompts are explicitly rejected, not silently queued.
@@ -29,19 +29,17 @@ The examples below use `/path/to/pi-remote` as a placeholder for your local chec
 
 ## 1. Run the relay
 
-For **interactive configuration**, first load the extension and run `/remote setup` as described in [step 2](#2-load-the-extension-on-your-computer). The relay need not be running yet. Copy its printed `export PI_REMOTE_TOKEN=...` command into the relay's environment, then start the relay. **Do not generate a different token on the server.**
-
-For **manual configuration**, on your server:
+Start the relay on your server:
 
 ```sh
 cd /path/to/pi-remote
 npm ci
-
-# Manual setup only: generate once and use the SAME token on the pi machine.
-# With /remote setup, use its printed export command instead of this next line.
-export PI_REMOTE_TOKEN="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
 npm start
 ```
+
+When `PI_REMOTE_TOKEN` is **unset**, the relay generates a **43-character, 256-bit cryptographically random token** and prints it once after successfully starting. Copy the token **value** into `/remote setup` on each Pi client. The relay owns this credential; clients do not generate or rotate it.
+
+An automatically generated token is kept in process memory, so restarting the relay generates a **new token**. To keep the same relay-issued token across restarts, set `PI_REMOTE_TOKEN` to that value in the relay's private environment or environment file. Explicitly configured tokens must be at least 32 characters and are not printed at startup. Keep startup output and service logs private, since automatically generated credentials appear there.
 
 The relay binds to `127.0.0.1:8787`. Environment variables are read from the process; `.env` is **not automatically loaded**. Node supports `node --env-file=.env src/server.js` if you prefer a file. See `.env.example`.
 
@@ -123,16 +121,16 @@ Installing is optional. It loads the extension but does not configure or enable 
 
 In the pi terminal:
 
-1. Run `/remote setup` and enter the **root relay URL**, such as the actual `https://relay-host.example-tailnet.ts.net` URL printed by `tailscale serve status`, or your Caddy domain. HTTPS is required except for localhost development. If a valid URL is already configured, Enter keeps it; Escape cancels without changing settings.
-2. Setup generates a fresh **43-character passphrase with 256 bits of cryptographic randomness** for `PI_REMOTE_TOKEN`. Copy the printed `export PI_REMOTE_TOKEN='...'` command to the **relay machine**, or place that value in the relay's private environment file. Keep it secret.
-3. Start/restart the relay with that token. Setup does **not** change the relay's configuration, manage Tailscale/Caddy, or enable remote access automatically.
+1. Start the relay as described in [step 1](#1-run-the-relay), then run `/remote setup` in Pi and enter the **root relay URL**, such as the actual `https://relay-host.example-tailnet.ts.net` URL printed by `tailscale serve status`, or your Caddy domain. HTTPS is required except for localhost development. If a valid URL is already configured, Enter keeps it; Escape cancels without changing settings.
+2. Confirm replacement if settings already exist, then paste the **relay-issued token value** from the relay's startup output (or obtain its explicitly configured token from the relay operator). Enter keeps an existing token only for the same relay URL; the token is never shown as a default or repeated in the completion notification.
+3. Setup saves this Pi client's credentials; it does **not** generate or rotate tokens, change the running relay, manage Tailscale/Caddy, or enable remote access automatically.
 4. Run `/remote` to enable access, then follow [step 3](#3-connect-your-phone) to pair your phone.
 
 The URL and token are saved to `~/.pi/agent/pi-remote.json` (or the directory selected by `PI_CODING_AGENT_DIR`). The file is written atomically with mode `0600` on Unix, and `/remote` loads it automatically. Setup also applies the values to the current pi process, so no pi restart is needed; your parent shell is unchanged. This is a dedicated extension file, not a modification to pi's main settings or session transcript. Pairing encryption keys are separate and are never stored there.
 
 Explicit `PI_REMOTE_URL` and `PI_REMOTE_TOKEN` environment variables take precedence over saved settings on later launches. Update or unset old overrides **in the shell that launches pi**, not the relay's environment. To override a saved URL with a different relay, supply its token too; saved tokens are not sent to another relay.
 
-Run `/remote off` before re-running setup. Replacing existing settings requires confirmation and generates a **new token**: update the relay and any other pi hosts that share it. `/remote off`, session changes, or shutdown cancel a pending setup dialog. Setup requires an interactive UI; non-interactive clients can use the environment variables below instead.
+Run `/remote off` before re-running setup. Replacing existing settings requires confirmation but does not affect the relay or other clients. If the relay issues a new token after a restart, update the saved token on each Pi client before reconnecting. `/remote off`, session changes, or shutdown cancel a pending setup dialog. Setup requires an interactive UI; non-interactive clients can use the environment variables below instead.
 
 ### Manual configuration (optional)
 
@@ -143,11 +141,11 @@ Before starting pi, set both variables instead of using the setup wizard:
 # Tailscale Serve: the actual .ts.net URL printed by `tailscale serve status`.
 # Caddy: your configured domain, e.g. https://pi.example.com.
 export PI_REMOTE_URL=https://relay-host.example-tailnet.ts.net
-export PI_REMOTE_TOKEN='the-same-server-token'
+export PI_REMOTE_TOKEN='the-token-issued-by-the-relay'
 pi -e /path/to/pi-remote/extension/remote.ts
 ```
 
-The relay and extension must use the same token, whether it was generated by setup or manually.
+The relay and Pi extension must use the same relay-issued token. Phones use the separate private QR/pairing link; the relay token is never included in it.
 
 ## 3. Connect your phone
 
@@ -167,7 +165,7 @@ For a localhost-only smoke test, set `PI_REMOTE_URL=http://localhost:8787` and o
 - Pi is authoritative. Losing the relay/phone connection does not interrupt local work.
 - Computer sleep or pi exit makes the session unavailable; the relay does not keep your agent alive.
 - Latest snapshots contain up to **40 messages**, with **4,000 characters per message**. Snapshots also have a 600 KB UTF-8 JSON budget; older messages are omitted when necessary to stay below the encrypted transport limit. Session names and IDs are capped at 256 characters, and active tool names at 100 entries of 128 characters each. Snapshot failures are contained and shown in the terminal status instead of crashing pi. Thinking, images, raw tool arguments, and custom messages are omitted. Public tool output can still contain sensitive information.
-- There is no durable relay database. Disconnected rooms expire after approximately five minutes. A restarted relay is repopulated by reconnecting pi hosts; if a phone reconnects first, reopen its link once pi is connected. Stale host connections and temporary room/client capacity limits cause retryable `1013` closes, not revocation; hosts and phones retain their pairing and retry as capacity becomes available. Invalid authentication still produces a terminal `1008` rejection.
+- There is no durable relay database. Disconnected rooms expire after approximately five minutes. With a stable, explicitly configured relay token, a restarted relay is repopulated by reconnecting pi hosts; if a phone reconnects first, reopen its link once pi is connected. With automatic startup tokens, update each Pi client's token after a relay restart and re-enable `/remote`. Stale host connections and temporary room/client capacity limits cause retryable `1013` closes, not revocation; hosts and phones retain their pairing and retry as capacity becomes available. Invalid authentication still produces a terminal `1008` rejection.
 - Commands expire after two minutes and are deduplicated for the active pairing. After 10,000 commands, start a fresh pairing. A successful prompt acknowledgement is sent when that submission's own agent turn starts, not when the task completes. Its asynchronous invocation context is tracked, so unrelated local turns cannot acknowledge it. Pi’s fire-and-forget submission API does not expose asynchronous preflight errors or cancellation. While submission is pending, the phone disables **Stop agent** and the host explicitly rejects interrupt requests; an idle abort cannot cancel preflight. If no correlated turn starts within 15 seconds, the phone receives an unknown-outcome warning. The submission identity and lock remain until that submission's turn starts or remote access is disabled, preventing an unrelated or late start from acknowledging a newer prompt. Check pi before restarting `/remote` or resending: a delayed submission may still execute. Retries of the same command ID never submit it again.
 - No follow-up/steering queue, file browser, dedicated diff viewer, multi-session account dashboard, push notifications, or voice input yet.
 - Starting/switching/forking a pi session disables remote access; enable it again in the new session. Branch navigation rebuilds the transcript.
@@ -177,7 +175,7 @@ For a localhost-only smoke test, set `PI_REMOTE_URL=http://localhost:8787` and o
 
 **A pairing link or its QR code grants agent control, which can amount to shell access. Treat both like passwords.** Do not share them in screenshots, tickets, or public messages.
 
-The setup file contains a plaintext relay token protected by user-only file permissions. Keep it, the generated-token notification, and any relay environment file private; do not commit them to a repository or embed secrets in Nix configuration that puts them in the world-readable `/nix/store`. Setup uses terminal UI only: it does not add credentials to model messages, the session transcript, or phone snapshots.
+The setup file contains a plaintext relay token protected by user-only file permissions. Keep it, the relay's generated-token startup output, and any relay environment file private; do not commit them to a repository or embed secrets in Nix configuration that puts them in the world-readable `/nix/store`. Setup uses terminal UI only: it does not add credentials to model messages, the session transcript, or phone snapshots.
 
 The relay routes encrypted snapshots, acknowledgements, and commands. It can see room identifiers, connection timing, and ciphertext sizes, but does not receive the encryption key. Host and client packets use different authenticated encryption contexts to prevent reflection. Protocol v2 also authenticates each packet type (`state`, `ack`, or `command`), preventing relabelling attacks. The client validates snapshot/acknowledgement schemas before changing its revision or UI, and uses text rendering, not unsafe HTML.
 
@@ -193,7 +191,7 @@ The relay enforces payload, connection, room, client, and per-connection message
 npm run check  # TypeScript checks and Node tests; no model calls
 ```
 
-Tests exercise Node/browser cryptography interoperability, transcript filtering, relay authentication/routing/reconnect/replay/revocation, extension prompt/interrupt/deduplication behavior against a real relay with mocked pi APIs, same-document pairing and key-import races, temporary capacity recovery, QR decoding (including the complete private fragment, terminal themes, and narrow-width fallback), and interactive setup (validation, token generation, private persistence, cancellation, and relay authentication). A real pi 1.1.0 SDK test verifies the setup UI and submission identity across delayed/transformed preflight and unrelated local turns using a synthetic stream (no model requests). Extension loading, setup, and QR pairing were also verified through the real pi 1.1.0 RPC CLI (including URL retries, private persistence, independently decoded QR payloads, relay authentication, and an empty transcript). A 390px-wide Chromium smoke check covered pairing, prompt submission, encrypted acknowledgement, layout, and disconnect.
+Tests exercise Node/browser cryptography interoperability, transcript filtering, relay authentication/routing/reconnect/replay/revocation, extension prompt/interrupt/deduplication behavior against a real relay with mocked pi APIs, same-document pairing and key-import races, temporary capacity recovery, QR decoding (including the complete private fragment, terminal themes, and narrow-width fallback), and interactive setup (relay-issued token input, validation, private persistence, cancellation, and relay authentication), plus relay startup token generation, explicit overrides, and restart rotation. A real pi 1.1.0 SDK test verifies the setup UI and submission identity across delayed/transformed preflight and unrelated local turns using a synthetic stream (no model requests). Extension loading, setup, and QR pairing were also verified through the real pi 1.1.0 RPC CLI (including URL retries, private persistence, independently decoded QR payloads, relay authentication, and an empty transcript). A 390px-wide Chromium smoke check covered pairing, prompt submission, encrypted acknowledgement, layout, and disconnect.
 
 ### Protocol sketch
 

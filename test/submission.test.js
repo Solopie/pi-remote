@@ -16,7 +16,7 @@ import { pairingMessage } from '../src/pairing.js';
 test('Pi 1.1.0 supports interactive setup and preserves submission identity through delayed, transformed preflight', { timeout: 10000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'pi-remote-submission-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const sockets = [], notices = [];
+  const sockets = [], notices = [], issuedToken = randomToken();
   class HostSocket {
     static OPEN = 1; readyState = 1; bufferedAmount = 0; sent = []; listeners = new Map();
     constructor() { sockets.push(this); }
@@ -65,12 +65,13 @@ test('Pi 1.1.0 supports interactive setup and preserves submission identity thro
     session.dispose();
   });
   await session.bindExtensions({ uiContext: { setStatus() {}, notify: text => notices.push(text),
-    input: async () => 'http://localhost:8787', confirm: async () => true } });
+    input: async title => title.startsWith('Relay token') ? issuedToken : 'http://localhost:8787', confirm: async () => true } });
   await session.prompt('/remote setup');
   assert.equal(sockets.length, 0);
   const config = await readConfig(join(dir, 'pi-remote.json'));
   assert.match(config.token, /^[A-Za-z0-9_-]{43}$/);
-  assert.ok(notices.at(-1).includes(`export PI_REMOTE_TOKEN='${config.token}'`));
+  assert.equal(config.token, issuedToken);
+  assert.ok(notices.every(notice => !notice.includes(issuedToken)));
   assert.equal(session.sessionManager.getBranch().filter(entry => entry.type === 'message').length, 0);
   await session.prompt('/remote');
   const pairing = notices.at(-1);

@@ -138,17 +138,20 @@ test('configuration errors never echo secret contents and explicit environment s
   await assert.rejects(resolveConfig(file, { PI_REMOTE_URL: env.PI_REMOTE_URL }), /Saved tokens are not sent to a different relay/);
 });
 
-test('/remote setup generates and saves a strong token without enabling access or sending a user message', async t => {
-  const h = await extension(t, { inputs: ['  https://RELAY.example-tailnet.ts.net/  '] });
+test('/remote setup saves the relay-issued token without generating one, enabling access, or sending a user message', async t => {
+  const issuedToken = randomToken();
+  const h = await extension(t, { inputs: ['  https://RELAY.example-tailnet.ts.net/  ', issuedToken] });
   await h.handler(' setup ');
   const config = await readConfig(h.file);
   assert.equal(config.url, 'https://relay.example-tailnet.ts.net');
   assert.match(config.token, /^[A-Za-z0-9_-]{43}$/); assert.equal(Buffer.from(config.token, 'base64url').length, 32);
-  assert.equal(h.generated, 1); assert.equal(h.sockets.length, 0); assert.deepEqual(h.prompts, []);
+  assert.equal(config.token, issuedToken);
+  assert.equal(h.generated, 0); assert.equal(h.sockets.length, 0); assert.deepEqual(h.prompts, []);
   assert.equal(h.env.PI_REMOTE_URL, config.url); assert.equal(h.env.PI_REMOTE_TOKEN, config.token);
-  assert.equal(h.dialogs.length, 1); assert.equal(h.dialogs[0].type, 'input');
-  assert.match(h.notices.at(-1).text, /Start\/restart the relay/);
-  assert.ok(h.notices.at(-1).text.includes(`export PI_REMOTE_TOKEN='${config.token}'`));
+  assert.equal(h.dialogs.length, 2); assert.equal(h.dialogs[0].type, 'input');
+  assert.match(h.dialogs[1].title, /Relay token/);
+  assert.ok(h.notices.every(notice => !notice.text.includes(issuedToken)));
+  assert.ok(h.dialogs.every(dialog => !JSON.stringify(dialog).includes(issuedToken)));
   assert.deepEqual(Array.from(h.completions('s'), item => item.value), ['setup']);
   await h.handler('on');
   const ws = h.sockets[0]; assert.equal(ws.url, 'wss://relay.example-tailnet.ts.net/ws'); ws.emit('open');
@@ -161,7 +164,7 @@ test('/remote setup generates and saves a strong token without enabling access o
 });
 
 test('a fresh extension automatically uses saved setup, while explicit environment settings still win', async t => {
-  const dir = await directory(t), first = await extension(t, { dir, inputs: ['http://localhost:8787'] });
+  const dir = await directory(t), first = await extension(t, { dir, inputs: ['http://localhost:8787', randomToken()] });
   await first.handler('setup'); const saved = await readConfig(first.file);
   const fresh = await extension(t, { dir }); await fresh.handler(''); fresh.sockets[0].emit('open');
   assert.equal(fresh.sockets[0].url, 'ws://localhost:8787/ws'); assert.equal(fresh.sockets[0].sent[0].token, saved.token);
@@ -173,10 +176,10 @@ test('a fresh extension automatically uses saved setup, while explicit environme
 
 test('setup retries unsafe URLs without echoing credentials or generating tokens before validation', async t => {
   const h = await extension(t, { inputs: ['http://100.64.0.1:8787', 'https://user:private-secret@relay.example',
-    'https://relay.example/ws', 'https://relay.example/#key=private-secret', '', 'https://valid.example'] });
+    'https://relay.example/ws', 'https://relay.example/#key=private-secret', '', 'https://valid.example', randomToken()] });
   await h.handler('setup');
   assert.equal((await readConfig(h.file)).url, 'https://valid.example');
-  assert.equal(h.generated, 1); assert.equal(h.dialogs.filter(dialog => dialog.type === 'input').length, 6);
+  assert.equal(h.generated, 0); assert.equal(h.dialogs.filter(dialog => dialog.type === 'input').length, 7);
   assert.equal(h.notices.filter(notice => notice.type === 'error').length, 5);
   assert.ok(h.notices.every(notice => !notice.text.includes('private-secret')));
 });
@@ -184,7 +187,8 @@ test('setup retries unsafe URLs without echoing credentials or generating tokens
 test('cancelling URL input or refusing token replacement leaves saved settings and environment unchanged', async t => {
   const dir = await directory(t), file = join(dir, 'pi-remote.json');
   const original = { url: 'https://old.example', token: randomToken() }; await saveConfig(file, original);
-  for (const options of [{ inputs: [undefined] }, { inputs: ['https://new.example'], confirmations: [false] }]) {
+  for (const options of [{ inputs: [undefined] }, { inputs: ['https://new.example'], confirmations: [false] },
+    { inputs: ['https://new.example', undefined], confirmations: [true] }]) {
     const env = { PI_REMOTE_URL: original.url, PI_REMOTE_TOKEN: original.token };
     const h = await extension(t, { dir, env, ...options }); await h.handler('setup');
     assert.deepEqual(await readConfig(file), original); assert.deepEqual(env, { PI_REMOTE_URL: original.url, PI_REMOTE_TOKEN: original.token });
@@ -192,19 +196,54 @@ test('cancelling URL input or refusing token replacement leaves saved settings a
   }
 });
 
-test('repeated setup requires confirmation and generates a fresh token, with Enter preserving the relay URL', async t => {
+test('setup rejects missing or weak tokens and only saves the supplied relay token', async t => {
+  const issuedToken = randomToken();
+  const h = await extension(t, { inputs: ['https://relay.example', '', 'short', `  ${issuedToken}  `] });
+  await h.handler('setup');
+  assert.equal((await readConfig(h.file)).token, issuedToken); assert.equal(h.generated, 0);
+  assert.equal(h.notices.filter(notice => notice.type === 'error').length, 2);
+  assert.ok(h.notices.every(notice => !notice.text.includes(issuedToken)));
+});
+
+test('changing relay URL never defaults to the old relay token, even with an environment URL override', async t => {
+  const dir = await directory(t), old = { url: 'https://old.example', token: randomToken() };
+  await saveConfig(join(dir, 'pi-remote.json'), old);
+  const issuedToken = randomToken();
+  const h = await extension(t, { dir, env: { PI_REMOTE_URL: 'https://new.example' },
+    inputs: ['', '', issuedToken], confirmations: [true] });
+  await h.handler('setup');
+  assert.deepEqual(await readConfig(h.file), { url: 'https://new.example', token: issuedToken });
+  assert.doesNotMatch(h.dialogs.find(dialog => dialog.title.startsWith('Relay token')).title, /keeps/);
+  assert.equal(h.notices.filter(notice => notice.type === 'error').length, 1);
+  assert.equal(h.generated, 0);
+});
+
+test('/remote off aborts a pending token prompt without saving or exposing the supplied credential', async t => {
+  const h = await extension(t), shown = deferred(), input = deferred(), issuedToken = randomToken();
+  h.ctx.ui.input = (title, _placeholder, options) => {
+    if (!title.startsWith('Relay token')) return Promise.resolve('https://relay.example');
+    shown.resolve(options.signal); return input.promise;
+  };
+  const pending = h.handler('setup'), signal = await shown.promise;
+  await h.handler('off'); assert.equal(signal.aborted, true);
+  input.resolve(issuedToken); await pending;
+  assert.equal(await readConfig(h.file), undefined); assert.deepEqual(h.env, {});
+  assert.equal(h.generated, 0); assert.ok(h.notices.every(notice => !notice.text.includes(issuedToken)));
+});
+
+test('repeated setup requires confirmation and Enter preserves the URL and relay-issued token', async t => {
   const dir = await directory(t), original = { url: 'https://relay.example', token: randomToken() };
   await saveConfig(join(dir, 'pi-remote.json'), original);
-  const h = await extension(t, { dir, inputs: [''], confirmations: [true] }); await h.handler('setup');
+  const h = await extension(t, { dir, inputs: ['', ''], confirmations: [true] }); await h.handler('setup');
   const replacement = await readConfig(h.file);
-  assert.equal(replacement.url, original.url); assert.notEqual(replacement.token, original.token);
-  assert.match(h.dialogs.find(dialog => dialog.type === 'confirm').message, /other pi hosts/);
+  assert.equal(replacement.url, original.url); assert.equal(replacement.token, original.token);
+  assert.match(h.dialogs.find(dialog => dialog.type === 'confirm').message, /does not change the token/);
   assert.equal(h.dialogs[0].placeholder, original.url);
   assert.ok(h.notices.every(notice => !notice.text.includes(original.token)));
 });
 
 test('setup can repair corrupt settings, but normal activation fails closed without leaking file contents', async t => {
-  const h = await extension(t, { inputs: ['https://relay.example'], confirmations: [true] }), secret = randomToken();
+  const h = await extension(t, { inputs: ['https://relay.example', randomToken()], confirmations: [true] }), secret = randomToken();
   await writeFile(h.file, `private-secret-${secret}`);
   await h.handler('on'); assert.equal(h.sockets.length, 0);
   assert.ok(h.notices.every(notice => !notice.text.includes(secret)));
@@ -214,7 +253,7 @@ test('setup can repair corrupt settings, but normal activation fails closed with
 
 test('setup does not display an invalid credential-bearing environment URL as its default', async t => {
   const h = await extension(t, { env: { PI_REMOTE_URL: 'https://user:never-print-this@relay.example', PI_REMOTE_TOKEN: randomToken() },
-    inputs: ['https://relay.example'], confirmations: [true] });
+    inputs: ['https://relay.example', randomToken()], confirmations: [true] });
   await h.handler('setup');
   assert.ok(h.dialogs.every(dialog => !JSON.stringify(dialog).includes('never-print-this')));
   assert.ok(h.notices.every(notice => !notice.text.includes('never-print-this')));
@@ -233,7 +272,7 @@ test('setup refuses to reconfigure live access or run without an interactive UI'
 
 test('save failures do not change active process credentials, enable access, or expose an unusable token', async t => {
   const env = { PI_REMOTE_URL: 'https://old.example', PI_REMOTE_TOKEN: randomToken() }, original = { ...env };
-  const h = await extension(t, { env, inputs: ['https://new.example'], confirmations: [true], save: async () => { throw Error('Disk unavailable'); } });
+  const h = await extension(t, { env, inputs: ['https://new.example', randomToken()], confirmations: [true], save: async () => { throw Error('Disk unavailable'); } });
   await h.handler('setup'); assert.deepEqual(env, original);
   assert.equal(h.sockets.length, 0); assert.equal(await readConfig(h.file), undefined);
   assert.match(h.notices.at(-1).text, /Disk unavailable/); assert.doesNotMatch(h.notices.at(-1).text, /export PI_REMOTE_TOKEN/);
@@ -246,14 +285,14 @@ test('/remote off cancels a pending wizard without allowing it to overwrite a ne
   await h.handler('on'); assert.match(h.notices.at(-1).text, /in progress/); assert.equal(h.sockets.length, 0);
   await h.handler('off'); assert.equal(signal.aborted, true);
   const newShown = deferred(), newInput = deferred();
-  h.ctx.ui.input = () => { newShown.resolve(); return newInput.promise; };
+  h.ctx.ui.input = title => { if (title.startsWith('Relay token')) return Promise.resolve(randomToken()); newShown.resolve(); return newInput.promise; };
   const newSetup = h.handler('setup'); await newShown.promise;
   oldInput.resolve('https://stale.example'); await oldSetup;
   await h.handler('on'); assert.match(h.notices.at(-1).text, /in progress/);
   assert.equal(await readConfig(h.file), undefined);
   newInput.resolve('https://current.example'); await newSetup;
   assert.equal((await readConfig(h.file)).url, 'https://current.example');
-  assert.equal(h.generated, 1); assert.equal(h.sockets.length, 0);
+  assert.equal(h.generated, 0); assert.equal(h.sockets.length, 0);
 });
 
 test('session changes and shutdown cancel pending setup before credentials are generated or saved', async t => {
@@ -267,17 +306,15 @@ test('session changes and shutdown cancel pending setup before credentials are g
   }
 });
 
-test('a generated setup token authenticates a real relay after updating its environment and restarting', async t => {
-  let app = createRelay({ token: randomToken() });
+test('a client imports the running relay token and authenticates without restarting or reconfiguring the relay', async t => {
+  const issuedToken = randomToken(), app = createRelay({ token: issuedToken });
   app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening');
   t.after(() => app.close());
   const port = app.server.address().port;
-  const h = await extension(t, { inputs: [`http://127.0.0.1:${port}`] });
+  const h = await extension(t, { inputs: [`http://127.0.0.1:${port}`, issuedToken] });
   await h.handler('setup'); const config = await readConfig(h.file);
   assert.equal(h.sockets.length, 0);
-  // This is the operator's relay-side step; setup deliberately cannot do it remotely.
-  await app.close(); app = createRelay({ token: config.token });
-  app.server.listen(port, '127.0.0.1'); await once(app.server, 'listening');
+  assert.equal(config.token, issuedToken); assert.equal(h.generated, 0);
   const fresh = await extension(t, { dir: h.ctx.cwd, network: true }); await fresh.handler('on');
   const joined = JSON.parse((await once(fresh.sockets[0], 'message'))[0]);
   assert.equal(joined.type, 'joined'); assert.equal(app.rooms.size, 1);
