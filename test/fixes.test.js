@@ -847,3 +847,69 @@ test('usage refresh follows model switches, ignores stale requests, and stops wh
   await h.handler('off', h.ctx);
   assert.equal(h.clock.count(300000), 0);
 });
+
+const cyberRiskError = 'Codex error: This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. If you’re doing authorized security work that requires more cyber permissive safeguards, apply for Daybreak access via https://platform.openai.com/settings/organization/status-and-access before retrying.';
+
+test('provider error-only messages survive projection, including Codex cybersecurity refusals', () => {
+  const message = publicMessage({ role: 'assistant', content: [], stopReason: 'error', errorMessage: cyberRiskError, privateMetadata: 'not-forwarded' });
+  assert.ok(message);
+  assert.equal(message.text, '');
+  assert.equal(message.stopReason, 'error');
+  assert.equal(message.errorMessage, cyberRiskError);
+  assert.ok(!JSON.stringify(message).includes('not-forwarded'));
+  assert.equal(publicMessage({ role: 'assistant', content: [], stopReason: 'error' }).errorMessage, 'The model provider returned an error without a message.');
+  assert.equal(publicMessage({ role: 'assistant', content: [], stopReason: 'aborted' }).errorMessage, 'Response interrupted.');
+  assert.equal(publicMessage({ role: 'assistant', content: [], stopReason: 'error', errorMessage: 'x'.repeat(10000) }).errorMessage.length, 4000);
+  for (const role of ['user', 'toolResult', 'assistant']) {
+    const projected = publicMessage({ role, content: 'Visible', stopReason: role === 'assistant' ? 'stop' : 'error', errorMessage: 'hidden-error' });
+    assert.equal(projected.errorMessage, undefined);
+  }
+});
+
+test('extension publishes live errors without losing partial replies, and replays errors on re-enable', async t => {
+  const branch = [], h = await extension(t, branch);
+  const failure = { role: 'assistant', content: [{ type: 'text', text: 'Partial reply' }], timestamp: 1, stopReason: 'error', errorMessage: cyberRiskError };
+  h.events.get('message_start')({ message: { ...failure, stopReason: 'stop', errorMessage: undefined } }, h.ctx);
+  h.events.get('message_end')({ message: failure }, h.ctx);
+  h.events.get('agent_end')({}, h.ctx);
+  h.clock.run(150);
+  const state = () => open(h.key, h.sockets[0].sent.filter(packet => packet.type === 'state').at(-1).payload, 'host', 'state');
+  assert.equal(state().messages.length, 1);
+  assert.equal(state().messages[0].text, 'Partial reply');
+  assert.equal(state().messages[0].errorMessage, cyberRiskError);
+  branch.push({ type: 'message', message: failure });
+  await h.handler('off', h.ctx); await h.handler('', h.ctx); h.join(h.sockets.at(-1));
+  h.clock.run(150);
+  const ws = h.sockets.at(-1), link = new URL(h.notices.at(-1).split('\n').at(-1));
+  const key = new URLSearchParams(link.hash.slice(1)).get('key');
+  const replay = open(key, ws.sent.filter(packet => packet.type === 'state').at(-1).payload, 'host', 'state');
+  assert.equal(replay.messages[0].errorMessage, cyberRiskError);
+  assert.equal(h.prompts.length, 0);
+});
+
+test('browser renders provider failures as literal error cards, not blank replies or Markdown', async () => {
+  const h = await browser();
+  const errorMessage = cyberRiskError + '\n<img src=x onerror=alert(1)> **literal**';
+  await h.receive('state', snapshot(1, { busy: false, messages: [{ role: 'assistant', text: '', stopReason: 'error', errorMessage }] }));
+  const error = () => h.element('messages').children[0].children.at(-1);
+  assert.equal(error().className, 'provider-error');
+  assert.equal(error().children[0].textContent, 'Provider error');
+  assert.equal(error().children[1].textContent, errorMessage);
+  assert.equal(error().children[1].tag, 'pre');
+  assert.equal(h.element('status').textContent, 'Provider error · see latest reply');
+  h.element('markdown-toggle').onclick();
+  assert.equal(error().children[1].textContent, errorMessage);
+  for (const invalid of [
+    { role: 'user', text: '', stopReason: 'error', errorMessage: 'invalid' },
+    { role: 'assistant', text: '', stopReason: 'error', errorMessage: 'x'.repeat(4001) },
+    { role: 'assistant', text: '', stopReason: 'error', errorMessage: {} }
+  ]) {
+    await h.receive('state', snapshot(2, { messages: [invalid] }));
+    assert.equal(h.eval('revision'), 1);
+  }
+  await h.receive('state', snapshot(2, { busy: false, messages: [{ role: 'assistant', text: 'A later successful reply' }] }));
+  assert.equal(h.element('status').textContent, 'Connected · ready');
+  await h.receive('state', snapshot(3, { busy: false, messages: [{ role: 'assistant', text: '', stopReason: 'aborted', errorMessage: 'Interrupted by user' }] }));
+  assert.equal(error().className, 'provider-error interrupted');
+  assert.equal(error().children[0].textContent, 'Response interrupted');
+});

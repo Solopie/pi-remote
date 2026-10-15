@@ -4,7 +4,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { join } from 'node:path';
 import WebSocket from 'ws';
 import { randomToken, seal, open } from '../src/crypto.js';
-import { publicMessage, validCommand, boundSnapshot, toolCallDetails } from '../src/protocol.js';
+import { publicMessage, validCommand, boundSnapshot, toolCallDetails } from '../src/protocol.ts';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
 import { fetchWeeklyUsage, unavailableUsage } from '../src/usage.js';

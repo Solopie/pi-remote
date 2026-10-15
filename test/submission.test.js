@@ -95,6 +95,9 @@ test('Pi 1.1.0 supports interactive setup and preserves submission identity thro
   const users = session.sessionManager.getBranch().filter(entry => entry.type === 'message' && entry.message.role === 'user');
   assert.deepEqual(users.map(entry => publicMessage(entry.message).text), ['work', 'work (transformed)']);
   send(); assert.equal(remoteInputs, 1); assert.equal(acks().at(-1).ok, true);
+  await new Promise(resolve => setTimeout(resolve, 180));
+  const errorState = ws.sent.filter(packet => packet.type === 'state').map(packet => open(key, packet.payload, 'host', 'state')).at(-1);
+  assert.ok(errorState.messages.some(message => message.stopReason === 'error' && message.errorMessage.includes('Synthetic stream: no model request')));
   ws.emit('message', JSON.stringify({ type: 'command', payload: seal(key,
     { id: 'rename12', action: 'rename', text: 'Renamed from the phone', createdAt: Date.now() }, 'client', 'command') }));
   assert.equal(acks().at(-1).ok, true);

@@ -149,8 +149,9 @@ function controls() {
   $('next-turn').hidden = !busy;
   $('interrupt').disabled = !connected || !online || submitting
     || [...pending.values()].some(c => c.action === 'interrupt' || (c.action === 'prompt' && !busy));
-  $('status').className = !connected || !online ? 'connection-status status-offline' : submitting || busy ? 'connection-status status-working' : 'connection-status status-ready';
-  $('status').textContent = !connected ? 'Connecting to relay…' : !online ? 'Pi offline · waiting for reconnect' : submitting ? 'Submitting message · wait before interrupting' : busy ? 'Agent working' : 'Connected · ready';
+  const failed = latestState?.messages.at(-1)?.stopReason === 'error';
+  $('status').className = !connected || !online ? 'connection-status status-offline' : submitting || busy ? 'connection-status status-working' : failed ? 'connection-status status-error' : 'connection-status status-ready';
+  $('status').textContent = !connected ? 'Connecting to relay…' : !online ? 'Pi offline · waiting for reconnect' : submitting ? 'Submitting message · wait before interrupting' : busy ? 'Agent working' : failed ? 'Provider error · see latest reply' : 'Connected · ready';
 }
 function validToolCalls(calls) {
   return Array.isArray(calls) && calls.length <= 20 && calls.every(call => call
@@ -207,6 +208,9 @@ function render(state, repaint = false) {
     || !Array.isArray(state.messages) || state.messages.length > 40
     || !state.messages.every(message => message && ['user', 'assistant', 'toolResult'].includes(message.role)
       && typeof message.text === 'string' && message.text.length <= 4000
+      && (message.stopReason === undefined || (message.role === 'assistant' && ['error', 'aborted'].includes(message.stopReason)))
+      && (message.errorMessage === undefined || (message.role === 'assistant' && ['error', 'aborted'].includes(message.stopReason)
+        && typeof message.errorMessage === 'string' && message.errorMessage.length > 0 && message.errorMessage.length <= 4000))
       && (message.tool === undefined || (typeof message.tool === 'string' && message.tool.length <= 128))
       && (message.timestamp === undefined || (typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)))
       && (message.thinking === undefined || (message.role === 'assistant' && typeof message.thinking === 'string' && message.thinking.length <= 4000))
@@ -247,6 +251,15 @@ function render(state, repaint = false) {
       } else {
         const pre = document.createElement('pre'); pre.textContent = message.text; article.append(pre);
       }
+    }
+    if (message.errorMessage) {
+      const error = document.createElement('div');
+      error.className = message.stopReason === 'aborted' ? 'provider-error interrupted' : 'provider-error';
+      error.setAttribute('role', 'note');
+      const heading = document.createElement('div'); heading.className = 'error-heading';
+      heading.textContent = message.stopReason === 'aborted' ? 'Response interrupted' : 'Provider error';
+      const detail = document.createElement('pre'); detail.textContent = message.errorMessage;
+      error.append(heading, detail); article.append(error);
     }
     for (const [callIndex, call] of (message.toolCalls || []).entries()) {
       details(article, `message:${message.timestamp ?? index}:call:${call.id ?? callIndex}`, `${call.name} · input`, call.input, true);
