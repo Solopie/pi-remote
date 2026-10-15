@@ -12,6 +12,7 @@ import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot, toolCallDetails, MAX_SNAPSHOT_BYTES } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
+import { fetchWeeklyUsage, unavailableUsage } from '../src/usage.js';
 
 const token = randomToken();
 async function relay(t, options = {}) {
@@ -69,6 +70,12 @@ test('public transcript includes visible thinking and tool inputs, but omits ima
   assert.ok(validCommand({ id: '12345678', action: 'prompt', text: 'Hi' }));
   assert.ok(!validCommand({ id: '12345678', action: 'prompt', text: ' ' }));
   assert.ok(!validCommand({ id: '12345678', action: 'exec', text: 'Hi' }));
+  for (const action of ['steer', 'followUp']) {
+    assert.ok(validCommand({ id: '12345678', action, text: 'Hi' }));
+    for (const text of [undefined, ' ', 'x'.repeat(16001)]) {
+      assert.ok(!validCommand({ id: '12345678', action, text }));
+    }
+  }
 });
 
 test('thinking-only messages and tool inputs remain bounded, including cyclic and oversized arguments', () => {
@@ -119,7 +126,7 @@ test('relay rejects wrong host token and missing rooms; serves hardened UI', asy
   assert.equal((await fetch(`${app.url}/../package.json`)).status, 404);
 });
 
-test('/remote integrates with session APIs: prompts, deduplication, busy rejection, interrupt, revoke', async t => {
+test('/remote integrates with session APIs: prompts, steering, follow-ups, deduplication, interrupt, revoke', async t => {
   const app = await relay(t);
   const filename = new URL(`../extension/.test-${randomToken()}.mjs`, import.meta.url);
   await writeFile(filename, ts.transpileModule(await readFile(new URL('../extension/remote.ts', import.meta.url), 'utf8'), { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText);
@@ -127,12 +134,14 @@ test('/remote integrates with session APIs: prompts, deduplication, busy rejecti
   const oldURL = process.env.PI_REMOTE_URL, oldToken = process.env.PI_REMOTE_TOKEN;
   process.env.PI_REMOTE_URL = app.url; process.env.PI_REMOTE_TOKEN = token;
   t.after(() => { if (oldURL === undefined) delete process.env.PI_REMOTE_URL; else process.env.PI_REMOTE_URL = oldURL; if (oldToken === undefined) delete process.env.PI_REMOTE_TOKEN; else process.env.PI_REMOTE_TOKEN = oldToken; });
-  const events = new Map(), notices = [], prompts = [], starts = []; let handler, idle = true, interrupts = 0, failSubmission = false;
+  const events = new Map(), notices = [], prompts = [], starts = []; let handler, idle = true, interrupts = 0, failSubmission = false, sessionName, renames = 0;
   const ctx = { cwd: '/tmp/project', isIdle: () => idle, hasPendingMessages: () => false, abort: () => interrupts++,
     ui: { setStatus() {}, notify: text => notices.push(text) }, sessionManager: { getSessionId: () => 'test-session', getBranch: () => [{ type: 'message', message: { role: 'user', content: 'Existing chat' } }] } };
-  const pi = { registerCommand: (_name, command) => { handler = command.handler; }, on: (name, fn) => events.set(name, fn), getSessionName: () => undefined,
+  const pi = { registerCommand: (_name, command) => { handler = command.handler; }, on: (name, fn) => events.set(name, fn), getSessionName: () => sessionName,
+    setSessionName: name => { renames++; sessionName = name; },
     sendUserMessage: (text, options) => {
       prompts.push({ text, options });
+      if (!idle) return; // Streaming submissions queue without a new agent_start.
       const start = AsyncResource.bind(() => { idle = false; events.get('agent_start')({}, ctx); });
       starts.push(start);
       if (!failSubmission) setTimeout(start, 20);
@@ -150,9 +159,28 @@ test('/remote integrates with session APIs: prompts, deduplication, busy rejecti
   const cmd = { id: '12345678', action: 'prompt', text: 'Do work', createdAt: Date.now() };
   phone.json({ type: 'command', payload: seal(key, cmd, 'client', 'command') }); assert.equal(open(key, (await phone.next('ack')).payload, 'host', 'ack').ok, true);
   phone.json({ type: 'command', payload: seal(key, cmd, 'client', 'command') }); await phone.next('ack'); assert.equal(prompts.length, 1);
-  assert.deepEqual(prompts[0].options, { expandPromptTemplates: false });
+  assert.deepEqual(prompts[0].options, { expandPromptTemplates: false, deliverAs: 'steer' });
+  const rename = { ...cmd, id: 'rename12', action: 'rename', text: '  New session name  ' };
+  phone.json({ type: 'command', payload: seal(key, rename, 'client', 'command') });
+  assert.equal(open(key, (await phone.next('ack')).payload, 'host', 'ack').ok, true);
+  assert.equal(sessionName, 'New session name');
+  phone.json({ type: 'command', payload: seal(key, rename, 'client', 'command') });
+  await phone.next('ack'); assert.equal(renames, 1);
+  assert.equal(prompts.length, 1); // Renaming while busy does not submit a message.
+
   phone.json({ type: 'command', payload: seal(key, { ...cmd, id: '22345678' }, 'client', 'command') });
-  assert.match(open(key, (await phone.next('ack')).payload, 'host', 'ack').error, /busy/);
+  assert.equal(open(key, (await phone.next('ack')).payload, 'host', 'ack').ok, true);
+  assert.deepEqual(prompts.at(-1).options, { expandPromptTemplates: false, deliverAs: 'steer' });
+  for (const [id, action, deliverAs] of [['steer123', 'steer', 'steer'], ['follow12', 'followUp', 'followUp']]) {
+    const queued = { ...cmd, id, action };
+    phone.json({ type: 'command', payload: seal(key, queued, 'client', 'command') });
+    assert.equal(open(key, (await phone.next('ack')).payload, 'host', 'ack').ok, true);
+    assert.deepEqual(prompts.at(-1), { text: cmd.text, options: { expandPromptTemplates: false, deliverAs } });
+    const count = prompts.length;
+    phone.json({ type: 'command', payload: seal(key, queued, 'client', 'command') });
+    assert.equal(open(key, (await phone.next('ack')).payload, 'host', 'ack').ok, true);
+    assert.equal(prompts.length, count);
+  }
   phone.json({ type: 'command', payload: seal(key, { ...cmd, id: '32345678', action: 'interrupt' }, 'client', 'command') }); await phone.next('ack'); assert.equal(interrupts, 1);
   idle = true; events.get('agent_end')({}, ctx);
   phone.json({ type: 'command', payload: seal(key, { ...cmd, id: '42345678', createdAt: 0 }, 'client', 'command') }); assert.match(open(key, (await phone.next('ack')).payload, 'host', 'ack').error, /expired/);
@@ -218,6 +246,35 @@ test('late prompt acknowledgement does not overwrite an idle snapshot', async ()
   await receive({ type: 'ack', payload: { id: 'command1', ok: true } });
   assert.equal(element('send').disabled, false);
   assert.equal(element('status').textContent, 'Connected · ready');
+  await receive({ type: 'state', payload: { revision: 3, busy: true, submitting: false, name: 'test', tools: [], messages: [] } });
+  assert.equal(element('send').disabled, false);
+  assert.equal(element('send').textContent, 'Send steer');
+  assert.equal(element('next-turn').hidden, false);
+  assert.equal(element('next-turn').disabled, false);
+  vm.runInContext("crypto.randomUUID = () => 'steer123'; sent = []; sendCommand = async value => sent.push(value);", context);
+  element('prompt').value = 'change direction';
+  element('prompt-form').onsubmit({ preventDefault() {} });
+  assert.equal(vm.runInContext('sent.at(-1).action', context), 'steer');
+  assert.equal(element('send').disabled, true);
+  assert.equal(element('next-turn').disabled, true);
+  await receive({ type: 'ack', payload: { id: 'steer123', ok: true } });
+  assert.equal(element('prompt').value, '');
+  assert.equal(element('notice').textContent, 'Steering message requested.');
+  element('prompt').value = 'then run tests';
+  vm.runInContext("crypto.randomUUID = () => 'follow12'", context);
+  element('next-turn').onclick();
+  assert.equal(vm.runInContext('sent.at(-1).action', context), 'followUp');
+  // Rejection preserves the draft; success must not erase a newer draft.
+  await receive({ type: 'ack', payload: { id: 'follow12', ok: false, error: 'busy' } });
+  assert.equal(element('prompt').value, 'then run tests');
+  element('next-turn').onclick();
+  element('prompt').value = 'new draft';
+  await receive({ type: 'ack', payload: { id: 'follow12', ok: true } });
+  assert.equal(element('prompt').value, 'new draft');
+  assert.equal(element('notice').textContent, 'Next-turn message requested.');
+  await receive({ type: 'state', payload: { revision: 4, busy: true, submitting: true, name: 'test', tools: [], messages: [] } });
+  assert.equal(element('send').disabled, true);
+  assert.equal(element('next-turn').disabled, true);
 });
 
 test('unauthenticated admission quota reserves capacity and releases after join', async t => {
@@ -303,7 +360,7 @@ test('snapshot publication bounds metadata and contains timer callback failures'
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
   const context = vm.createContext({ pi, WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join,
     getAgentDir: () => '/unused-pi-remote-test', process: { env: { PI_REMOTE_URL: 'http://localhost:8787', PI_REMOTE_TOKEN: token } },
-    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage,
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails, normalizeRelayURL, readConfig, saveConfig, resolveConfig, fetchWeeklyUsage, unavailableUsage, pairingMessage,
     setTimeout: fn => { callback = fn; return 1; }, clearTimeout() {} });
   vm.runInContext(`${source}\nremoteExtension(pi);`, context);
   await handler('', ctx);

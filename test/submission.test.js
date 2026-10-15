@@ -12,6 +12,7 @@ import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot, toolCallDetails } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
+import { fetchWeeklyUsage, unavailableUsage } from '../src/usage.js';
 
 test('Pi 1.1.0 supports interactive setup and preserves submission identity through delayed, transformed preflight', { timeout: 10000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'pi-remote-submission-'));
@@ -31,7 +32,7 @@ test('Pi 1.1.0 supports interactive setup and preserves submission identity thro
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
   const context = vm.createContext({ WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join, setTimeout, clearTimeout,
     getAgentDir: () => dir, process: { env: {} },
-    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage });
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails, normalizeRelayURL, readConfig, saveConfig, resolveConfig, fetchWeeklyUsage, unavailableUsage, pairingMessage });
   const remote = vm.runInContext(`${source}\nremoteExtension;`, context);
   let release, entered, settled, remoteReleased = false, remoteInputs = 0;
   const gate = new Promise(resolve => { release = resolve; });
@@ -94,4 +95,57 @@ test('Pi 1.1.0 supports interactive setup and preserves submission identity thro
   const users = session.sessionManager.getBranch().filter(entry => entry.type === 'message' && entry.message.role === 'user');
   assert.deepEqual(users.map(entry => publicMessage(entry.message).text), ['work', 'work (transformed)']);
   send(); assert.equal(remoteInputs, 1); assert.equal(acks().at(-1).ok, true);
+  ws.emit('message', JSON.stringify({ type: 'command', payload: seal(key,
+    { id: 'rename12', action: 'rename', text: 'Renamed from the phone', createdAt: Date.now() }, 'client', 'command') }));
+  assert.equal(acks().at(-1).ok, true);
+  assert.equal(session.sessionManager.getSessionName(), 'Renamed from the phone');
+  assert.equal(remoteInputs, 1);
+
+});
+
+test('real extension loader accepts remote renames and publishes the saved name', { timeout: 10000 }, async t => {
+  const { createRelay } = await import('../src/server.js');
+  const { once } = await import('node:events');
+  const { default: WebSocket } = await import('ws');
+  const { fileURLToPath } = await import('node:url');
+  const token = randomToken(), relay = createRelay({ token });
+  relay.server.listen(0, '127.0.0.1'); await once(relay.server, 'listening');
+  t.after(() => relay.close());
+  const env = { PI_REMOTE_URL: process.env.PI_REMOTE_URL, PI_REMOTE_TOKEN: process.env.PI_REMOTE_TOKEN };
+  process.env.PI_REMOTE_URL = `http://127.0.0.1:${relay.server.address().port}`;
+  process.env.PI_REMOTE_TOKEN = token;
+  t.after(() => { for (const [key, value] of Object.entries(env)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  const dir = await mkdtemp(join(tmpdir(), 'pi-remote-loader-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const settingsManager = SettingsManager.inMemory({ cacheWarmingMode: 'off' });
+  const modelRuntime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, refreshOnCreate: false });
+  const resourceLoader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager,
+    noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+    additionalExtensionPaths: [fileURLToPath(new URL('../extension/remote.ts', import.meta.url))] });
+  await resourceLoader.reload();
+  const { session } = await createAgentSession({ cwd: dir, agentDir: dir, settingsManager, modelRuntime, resourceLoader,
+    sessionManager: SessionManager.inMemory(dir), model: getModel('anthropic', 'claude-sonnet-4-5'), tools: [] });
+  const notices = [];
+  await session.bindExtensions({ uiContext: { setStatus() {}, notify: text => notices.push(text) } });
+  t.after(async () => { await session.prompt('/remote off'); session.dispose(); });
+  await session.prompt('/remote');
+  const link = new URL(notices.at(-1).split('\n').at(-1)), params = new URLSearchParams(link.hash.slice(1));
+  const key = params.get('key'), room = params.get('room');
+  for (let i = 0; !relay.rooms.get(room)?.host && i < 100; i++) await new Promise(r => setTimeout(r, 10));
+  const phone = new WebSocket(`ws://127.0.0.1:${relay.server.address().port}/ws`);
+  t.after(() => phone.terminate());
+  const received = [];
+  phone.on('message', raw => { const packet = JSON.parse(raw); if (packet.payload) received.push({ type: packet.type, value: open(key, packet.payload, 'host', packet.type) }); });
+  await once(phone, 'open'); phone.send(JSON.stringify({ type: 'join', role: 'client', room }));
+  const waitFor = async predicate => {
+    for (let i = 0; i < 200; i++) { const value = received.find(predicate); if (value) return value; await new Promise(r => setTimeout(r, 10)); }
+    assert.fail('Expected encrypted packet was not received');
+  };
+  const initial = await waitFor(p => p.type === 'state');
+  assert.ok(initial.value.capabilities.includes('rename'));
+  phone.send(JSON.stringify({ type: 'command', payload: seal(key,
+    { id: 'rename12', action: 'rename', text: 'Real loader rename', createdAt: Date.now() }, 'client', 'command') }));
+  assert.equal((await waitFor(p => p.type === 'ack')).value.ok, true);
+  assert.equal(session.sessionManager.getSessionName(), 'Real loader rename');
+  await waitFor(p => p.type === 'state' && p.value.name === 'Real loader rename');
+  assert.equal(session.sessionManager.getBranch().filter(entry => entry.type === 'message').length, 0);
 });

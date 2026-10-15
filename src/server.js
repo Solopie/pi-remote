@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
-import { randomToken } from './crypto.js';
+import { randomToken, open } from './crypto.js';
 import { createGoogleAuth, googleConfig } from './auth.js';
 import { WebSocketServer, WebSocket } from 'ws';
 
@@ -24,7 +24,7 @@ export function createRelay({ token, roomTTL = 300000, maxRooms = 100, maxConnec
   const auth = suppliedAuth || (google ? createGoogleAuth(google) : undefined);
   const rooms = new Map(), admissions = new Map();
   let unauthenticated = 0;
-  const assets = {'/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'],
+  const assets = {'/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/marked.js': ['marked.js', 'text/javascript'],
     '/style.css': ['style.css', 'text/css'], '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json']};
   const server = http.createServer(async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
@@ -43,7 +43,7 @@ export function createRelay({ token, roomTTL = 300000, maxRooms = 100, maxConnec
         if (!user) { res.writeHead(401); return res.end(JSON.stringify({ error: 'Sign-in required.' })); }
         if (req.method !== 'GET') { res.writeHead(405); return res.end(JSON.stringify({ error: 'Method not allowed.' })); }
         if (path === '/api/sessions') return res.end(JSON.stringify({ sessions: [...rooms.values()].filter(room => room.host).map(room => ({
-          room: room.id, name: room.discovery?.name || 'Pi session', connectable: !!room.discovery })) }));
+          room: room.id, name: room.discovery?.name || 'Pi session', connectable: !!room.discovery, status: room.status || 'unknown' })) }));
         const room = rooms.get(path.slice('/api/sessions/'.length));
         if (!room?.host || !room.discovery) { res.writeHead(404); return res.end(JSON.stringify({ error: 'Session unavailable or not enrolled.' })); }
         return res.end(JSON.stringify({ room: room.id, key: room.discovery.key }));
@@ -126,6 +126,7 @@ export function createRelay({ token, roomTTL = 300000, maxRooms = 100, maxConnec
               if (!msg.discovery || typeof msg.discovery.key !== 'string' || !ROOM_ID.test(msg.discovery.key) || typeof msg.discovery.name !== 'string' || msg.discovery.name.length > 256) throw Error();
               discovery = { key: msg.discovery.key, name: msg.discovery.name };
             }
+            room.status = 'unknown';
             room.discovery = discovery; room.host = ws; room.touched = Date.now();
           } else {
             room = rooms.get(msg.room);
@@ -149,7 +150,21 @@ export function createRelay({ token, roomTTL = 300000, maxRooms = 100, maxConnec
         }
         if (!msg.payload || typeof msg.payload.iv !== 'string' || typeof msg.payload.data !== 'string') throw Error();
         if (role === 'host' && ['state', 'ack'].includes(msg.type)) {
-          if (msg.type === 'state') room.state = msg.payload;
+          if (msg.type === 'state') {
+            room.state = msg.payload;
+            room.status = 'unknown';
+            // Only opted-in sessions share keys with the relay. Never request
+            // plaintext activity metadata from private-pairing hosts.
+            if (room.discovery) try {
+              const state = open(room.discovery.key, msg.payload, 'host', 'state');
+              if (state && typeof state.name === 'string' && state.name.length <= 256 && state.name.trim()) {
+                room.discovery.name = state.name;
+              }
+              if (state && typeof state.busy === 'boolean' && typeof state.submitting === 'boolean') {
+                room.status = state.busy || state.submitting ? 'running' : 'idle';
+              }
+            } catch { /* Invalid/old snapshots must not be labelled idle. */ }
+          }
           for (const client of room.clients) send(client, { type: msg.type, payload: msg.payload });
         } else if (role === 'client' && msg.type === 'command') {
           if (!room.host) return send(ws, { type: 'presence', online: false });

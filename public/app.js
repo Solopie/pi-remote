@@ -8,14 +8,16 @@ if (typeof visualViewport !== 'undefined' && visualViewport) {
 let socket, cryptoKey, credentials, retryTimer, attempt = 0, generation = 0;
 let online = false, connected = false, busy = true, submitting = false, revision = -1;
 const pending = new Map();
+let markdownEnabled = false, latestState, lastUserElement;
 let authChecking = typeof fetch === 'function', authEnabled = false, authenticated = false, csrf = '', pendingPairLink;
 let dashboardGeneration = 0;
 function home() {
   $('login').hidden = !authEnabled || authenticated;
   $('dashboard').hidden = !authEnabled || !authenticated;
-  $('pair').hidden = authEnabled && !authenticated;
   $('logout').hidden = !authEnabled || !authenticated;
-  $('disconnect').textContent = authEnabled ? 'Sessions' : 'Disconnect';
+  $('disconnect-label').textContent = authEnabled ? 'Sessions' : 'Disconnect';
+  $('disconnect').setAttribute('aria-label', authEnabled ? 'Back to sessions' : 'Disconnect from session');
+  $('disconnect').title = authEnabled ? 'Back to sessions' : 'Disconnect from session';
 }
 async function refreshSessions() {
   if (!authEnabled || !authenticated || !$('workspace').hidden) return;
@@ -29,16 +31,49 @@ async function refreshSessions() {
     if (gen !== dashboardGeneration || !authenticated || !$('workspace').hidden) return;
     if (!Array.isArray(value.sessions) || value.sessions.length > 100 || !value.sessions.every(session => session
       && typeof session.room === 'string' && /^[A-Za-z0-9_-]{43}$/.test(session.room) && typeof session.name === 'string' && session.name.length <= 256
-      && typeof session.connectable === 'boolean')) throw Error();
-    const fragment = document.createDocumentFragment();
-    for (const session of value.sessions) {
-      const button = document.createElement('button'); button.className = 'session-choice';
-      button.textContent = session.name + (session.connectable ? '' : ' · pairing required'); button.disabled = !session.connectable;
-      button.onclick = () => selectSession(session.room); fragment.append(button);
-    }
-    if (!value.sessions.length) { const text = document.createElement('p'); text.textContent = 'No connected sessions. Enable /remote in Pi.'; fragment.append(text); }
-    $('session-list').replaceChildren(fragment);
+      && typeof session.connectable === 'boolean'
+      && (session.status === undefined || ['running', 'idle', 'unknown'].includes(session.status)))) throw Error();
+    renderSessionList(value.sessions);
   } catch { if (gen === dashboardGeneration && authenticated) notice('Could not load sessions. Try Refresh sessions.'); }
+}
+function renderSessionList(sessions) {
+  const make = (tag, className, text) => {
+    const el = document.createElement(tag); el.className = className;
+    if (text !== undefined) el.textContent = text;
+    return el;
+  };
+  const fragment = document.createDocumentFragment();
+  for (const session of sessions) {
+    const status = ['running', 'idle'].includes(session.status) ? session.status : 'unknown';
+    const label = status === 'running' ? 'Running' : status === 'idle' ? 'Idle' : 'Status unknown';
+    const button = make('button', `session-choice session-${status}`);
+    button.type = 'button'; button.disabled = !session.connectable;
+    const icon = make('span', 'session-icon', '>_'); icon.setAttribute('aria-hidden', 'true');
+    const body = make('span', 'session-body'), top = make('span', 'session-top');
+    const title = make('span', 'session-name', session.name || 'Untitled session');
+    const badge = make('span', `session-badge badge-${status}`, label);
+    top.append(title, badge);
+    const description = !session.connectable ? 'Pairing required · open its private link'
+      : status === 'running' ? 'Agent is working' : status === 'idle' ? 'Ready for your next message' : 'Activity not available yet';
+    body.append(top, make('span', 'session-description', description));
+    const arrow = make('span', 'session-arrow', session.connectable ? '↗' : '—');
+    arrow.setAttribute('aria-hidden', 'true');
+    button.append(icon, body, arrow);
+    button.onclick = () => selectSession(session.room);
+    fragment.append(button);
+  }
+  if (!sessions.length) {
+    const empty = make('div', 'sessions-empty');
+    const icon = make('span', 'empty-icon', '>_'); icon.setAttribute('aria-hidden', 'true');
+    empty.append(icon, make('h3', '', 'No sessions yet'),
+      make('p', 'muted', 'Run /remote in Pi to connect a session. It will appear here automatically.'));
+    fragment.append(empty);
+  }
+  const running = sessions.filter(session => session.status === 'running').length;
+  $('session-summary').textContent = sessions.length
+    ? `${sessions.length} connected ${sessions.length === 1 ? 'session' : 'sessions'}${running ? ` · ${running} running` : ''}`
+    : 'Your connected Pi sessions will appear here.';
+  $('session-list').replaceChildren(fragment);
 }
 async function selectSession(room) {
   const gen = ++dashboardGeneration;
@@ -60,7 +95,6 @@ function signedOut() {
 }
 async function initializeAuth() {
   // Fail closed if authentication status cannot be checked.
-  $('pair').hidden = true;
   try {
     const response = await fetch('/api/auth', { cache: 'no-store' });
     if (response.status === 404) { notice('Restart the relay with the updated server before using this client.'); return; }
@@ -72,6 +106,7 @@ async function initializeAuth() {
     home(); if (authenticated) $('account').textContent = `Signed in as ${value.email}`;
     if (pendingPairLink && (!authEnabled || authenticated)) { const link = pendingPairLink; pendingPairLink = undefined; await pair(link); }
     else if (authEnabled && !authenticated && pendingPairLink) notice('Sign in first, then reopen the pairing link if this session is not enrolled.');
+    else if (!authEnabled) notice('Open your private pairing link in this browser, or scan the QR code shown by /remote in Pi.');
     else await refreshSessions();
   } catch { notice('Could not check sign-in status. Refresh this page to try again.'); }
 }
@@ -102,9 +137,19 @@ async function open(envelope, type) {
 }
 function notice(text) { $('notice').textContent = text; }
 function controls() {
-  $('send').disabled = !connected || !online || busy || pending.size > 0;
+  const canRename = latestState?.capabilities?.includes('rename') === true;
+  $('rename-save').disabled = !connected || !online || pending.size > 0 || !canRename;
+  $('session-name').disabled = !canRename;
+  $('rename-help').textContent = canRename ? 'Saved to the Pi session, not just this browser.'
+    : 'This session is using an older remote extension. In Pi, run /remote off, /reload, then /remote to enable renaming.';
+  $('last-user').disabled = !lastUserElement;
+  $('send').disabled = !connected || !online || submitting || pending.size > 0;
+  $('send').textContent = busy ? 'Send steer' : 'Send';
+  $('next-turn').disabled = $('send').disabled;
+  $('next-turn').hidden = !busy;
   $('interrupt').disabled = !connected || !online || submitting
     || [...pending.values()].some(c => c.action === 'interrupt' || (c.action === 'prompt' && !busy));
+  $('status').className = !connected || !online ? 'connection-status status-offline' : submitting || busy ? 'connection-status status-working' : 'connection-status status-ready';
   $('status').textContent = !connected ? 'Connecting to relay…' : !online ? 'Pi offline · waiting for reconnect' : submitting ? 'Submitting message · wait before interrupting' : busy ? 'Agent working' : 'Connected · ready';
 }
 function validToolCalls(calls) {
@@ -113,10 +158,48 @@ function validToolCalls(calls) {
     && typeof call.input === 'string' && call.input.length <= 4000
     && (call.id === undefined || (typeof call.id === 'string' && call.id.length <= 128)));
 }
-function render(state) {
+function validModel(model) {
+  return model == null || (typeof model.id === 'string' && model.id.length <= 256
+    && typeof model.name === 'string' && model.name.length <= 256
+    && typeof model.provider === 'string' && model.provider.length <= 128);
+}
+function validPlanUsage(usage) {
+  return usage === undefined || (usage && typeof usage.provider === 'string' && usage.provider.length <= 128
+    && ['loading', 'available', 'unavailable', 'unsupported'].includes(usage.status)
+    && (usage.usedPercent === null || (typeof usage.usedPercent === 'number' && Number.isFinite(usage.usedPercent) && usage.usedPercent >= 0 && usage.usedPercent <= 100))
+    && (usage.status !== 'available' || typeof usage.usedPercent === 'number')
+    && [usage.updatedAt, usage.resetsAt].every(time => time === null || (Number.isSafeInteger(time) && time > 0))
+    && (usage.plan === null || (typeof usage.plan === 'string' && usage.plan.length <= 64)));
+}
+function renderSettingsInfo(state) {
+  const model = state.model, usage = state.planUsage;
+  $('active-model').textContent = model ? (model.name || model.id) : 'Not available';
+  $('active-model-provider').textContent = model ? `${model.provider}${model.name !== model.id ? ` · ${model.id}` : ''}` : 'Update the remote extension to report the active model.';
+  const available = usage?.status === 'available' && usage.provider === model?.provider;
+  $('weekly-usage-bar').hidden = !available;
+  if (available) {
+    $('weekly-usage').textContent = `${Math.round(usage.usedPercent)}% used`;
+    $('weekly-usage-bar').value = usage.usedPercent;
+    const parts = [];
+    if (usage.plan) parts.push(`${usage.plan} plan`);
+    if (usage.resetsAt) parts.push(`Resets ${new Date(usage.resetsAt).toLocaleString()}`);
+    if (usage.updatedAt) parts.push(`Checked ${new Date(usage.updatedAt).toLocaleTimeString()}`);
+    $('weekly-usage-detail').textContent = parts.join(' · ') || 'Reported by your subscription provider.';
+  } else {
+    $('weekly-usage').textContent = usage?.status === 'loading' ? 'Checking…' : 'Not available';
+    $('weekly-usage-detail').textContent = usage?.status === 'unsupported'
+      ? 'This provider does not expose weekly plan usage.'
+      : usage?.status === 'loading' ? 'Checking your subscription on the Pi host…'
+      : 'Requires a supported subscription login (Codex or Claude). API-key usage is not a weekly plan quota.';
+  }
+}
+function render(state, repaint = false) {
   // Validate before touching revision/UI, including the optional detail fields.
   if (!state || !Number.isSafeInteger(state.revision) || state.revision < 0
     || typeof state.busy !== 'boolean' || typeof state.submitting !== 'boolean'
+    || (state.capabilities !== undefined && (!Array.isArray(state.capabilities) || state.capabilities.length > 20
+      || !state.capabilities.every(value => typeof value === 'string' && value.length <= 64)))
+    || !validModel(state.model) || !validPlanUsage(state.planUsage)
     || typeof state.name !== 'string' || state.name.length > 256
     || !Array.isArray(state.tools) || state.tools.length > 100
     || !state.tools.every(tool => typeof tool === 'string' && tool.length <= 128)
@@ -128,9 +211,12 @@ function render(state) {
       && (message.timestamp === undefined || (typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)))
       && (message.thinking === undefined || (message.role === 'assistant' && typeof message.thinking === 'string' && message.thinking.length <= 4000))
       && (message.toolCalls === undefined || (message.role === 'assistant' && validToolCalls(message.toolCalls))))) throw Error('Invalid snapshot');
-  if (state.revision <= revision) return;
+  if (!repaint && state.revision <= revision) return;
+  latestState = state;
+  renderSettingsInfo(state);
   revision = state.revision; busy = state.busy; submitting = state.submitting;
   $('session').textContent = state.name;
+  $('session').title = state.name;
   $('activity').textContent = state.tools.length ? `Running: ${state.tools.join(', ')}` : '';
   const container = $('messages'), active = $('tool-calls'), chat = $('chat');
   const nearBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80;
@@ -144,16 +230,23 @@ function render(state) {
     const pre = document.createElement('pre'); pre.textContent = text;
     element.append(summary, pre); parent.append(element);
   };
+  lastUserElement = undefined;
   const fragment = document.createDocumentFragment();
   for (const [index, message] of state.messages.entries()) {
     const article = document.createElement('article'); article.className = `message ${message.role}`;
+    if (message.role === 'user') lastUserElement = article;
     const label = document.createElement('div'); label.className = 'role';
     label.textContent = message.role === 'toolResult' ? (message.tool || 'Tool output') : message.role;
     article.append(label);
     if (message.thinking) details(article, `message:${message.timestamp ?? index}:thinking`, 'Thinking', message.thinking, false, 'thinking');
     if (message.role === 'toolResult') details(article, `message:${message.timestamp ?? index}:output`, 'Show output', message.text);
     else if (message.text) {
-      const pre = document.createElement('pre'); pre.textContent = message.text; article.append(pre);
+      if (markdownEnabled && message.role === 'assistant') {
+        const body = document.createElement('div'); body.className = 'markdown';
+        renderMarkdown(body, message.text); article.append(body);
+      } else {
+        const pre = document.createElement('pre'); pre.textContent = message.text; article.append(pre);
+      }
     }
     for (const [callIndex, call] of (message.toolCalls || []).entries()) {
       details(article, `message:${message.timestamp ?? index}:call:${call.id ?? callIndex}`, `${call.name} · input`, call.input, true);
@@ -207,8 +300,9 @@ function connect(gen) {
         const command = pending.get(value.id); pending.delete(value.id);
         if (!value.ok) notice(value.error || 'Command rejected.');
         else {
-          if (command.action === 'prompt') { if ($('prompt').value === command.text) $('prompt').value = ''; }
-          notice(command.action === 'interrupt' ? 'Interrupt requested.' : 'Message accepted.');
+          if (command.action === 'rename' && $('session-name').value.trim() === command.text) closeSettings();
+          if (['prompt', 'steer', 'followUp'].includes(command.action)) { if ($('prompt').value === command.text) $('prompt').value = ''; }
+          notice(command.action === 'rename' ? 'Session renamed.' : command.action === 'interrupt' ? 'Interrupt requested.' : command.action === 'followUp' ? 'Next-turn message requested.' : command.action === 'steer' ? 'Steering message requested.' : 'Message accepted.');
         }
         controls();
       }
@@ -253,27 +347,79 @@ async function pair(link) {
     if (gen !== generation) return;
     credentials = { room }; cryptoKey = importedKey;
     revision = -1; busy = true; submitting = false; attempt = 0;
-    $('pair').hidden = true; $('dashboard').hidden = true; $('login').hidden = true; $('workspace').hidden = false; $('disconnect').hidden = false;
-    $('pair-link').value = ''; notice('Encrypted connection. Keep your pairing link private.'); connect(gen);
+    $('dashboard').hidden = true; $('login').hidden = true; $('workspace').hidden = false; $('disconnect').hidden = false; $('settings-toggle').hidden = false;
+    notice('Encrypted connection. Keep your pairing link private.'); connect(gen);
   } catch (error) { if (gen === generation) notice(error.message); }
 }
 function disconnect() {
+  closeSettings(); $('settings-toggle').hidden = true;
   generation++; clearTimeout(retryTimer); socket?.close(); socket = undefined;
   credentials = undefined; cryptoKey = undefined; pending.clear(); online = false; connected = false; submitting = false;
-  $('messages').replaceChildren(); $('workspace').hidden = true; $('pair').hidden = false; $('disconnect').hidden = true;
+  $('messages').replaceChildren(); $('workspace').hidden = true; $('disconnect').hidden = true;
   $('tool-calls').replaceChildren(); $('tool-calls').hidden = true;
-  $('prompt').value = ''; $('activity').textContent = ''; $('session').textContent = 'Your coding agent, anywhere.'; home();
+  latestState = undefined; lastUserElement = undefined;
+  $('last-user').disabled = true;
+  $('prompt').value = ''; $('activity').textContent = ''; $('session').textContent = 'Your coding agent, anywhere.'; $('session').title = ''; home();
 }
-$('pair-form').onsubmit = event => { event.preventDefault(); pair($('pair-link').value); };
 $('disconnect').onclick = () => { dashboardGeneration++; disconnect(); notice('Phone disconnected. To revoke access, run /remote off in Pi.'); refreshSessions(); };
 async function command(action, text) {
-  if (!connected || !online || submitting || (action === 'prompt' && (busy || pending.size))) return;
+  if (action === 'rename' && !latestState?.capabilities?.includes('rename')) {
+    notice('Update and reload the remote extension in this Pi session to enable renaming.'); return;
+  }
+  if (!connected || !online || (submitting && action !== 'rename') || (action !== 'interrupt' && pending.size > 0)) return;
   if (action === 'interrupt' && [...pending.values()].some(c => c.action === 'interrupt' || (c.action === 'prompt' && !busy))) return;
   const value = { id: crypto.randomUUID(), action, text, createdAt: Date.now() };
   pending.set(value.id, value); controls(); notice('Sending…');
   try { await sendCommand(value); } catch { pending.delete(value.id); controls(); notice('Could not send command.'); }
 }
-$('prompt-form').onsubmit = event => { event.preventDefault(); if ($('prompt').value.trim()) command('prompt', $('prompt').value); };
+function closeSettings() {
+  $('settings-panel').hidePopover?.();
+  $('settings-panel').hidden = true;
+  $('settings-toggle').setAttribute('aria-expanded', 'false');
+  $('session-name').value = '';
+}
+$('settings-toggle').onclick = () => {
+  if (!$('settings-panel').hidden) { closeSettings(); return; }
+  $('session-name').value = latestState?.name || '';
+  $('settings-panel').hidden = false;
+  $('settings-panel').showPopover?.();
+  $('settings-toggle').setAttribute('aria-expanded', 'true');
+  controls();
+  $('markdown-toggle').focus?.();
+};
+$('settings-cancel').onclick = () => { closeSettings(); $('settings-toggle').focus?.(); };
+$('settings-close').onclick = $('settings-cancel').onclick;
+$('settings-panel').ontoggle = event => {
+  const open = event.newState === 'open';
+  $('settings-panel').hidden = !open;
+  $('settings-toggle').setAttribute('aria-expanded', String(open));
+  if (!open) $('session-name').value = '';
+};
+// Native popovers handle outside-click dismissal; retain it on older browsers.
+function dismissSettingsOutside(event) {
+  const panel = $('settings-panel'), toggle = $('settings-toggle');
+  if (typeof panel.showPopover === 'function' || panel.hidden) return;
+  if (event.target === panel || event.target === toggle || panel.contains?.(event.target) || toggle.contains?.(event.target)) return;
+  closeSettings();
+}
+addEventListener('pointerdown', dismissSettingsOutside);
+
+$('settings-panel').onkeydown = event => {
+  if (event.key === 'Escape') { event.preventDefault(); closeSettings(); $('settings-toggle').focus?.(); }
+};
+$('rename-form').onsubmit = event => {
+  event.preventDefault();
+  const name = $('session-name').value.trim();
+  if (!name || name.length > 256 || /[\x00-\x1f\x7f]/.test(name)) { notice('Enter a session name between 1 and 256 characters, without control characters.'); return; }
+  command('rename', name);
+};
+$('last-user').onclick = () => {
+  if (!lastUserElement) return;
+  const chat = $('chat');
+  chat.scrollTop = Math.max(0, lastUserElement.getBoundingClientRect().top - chat.getBoundingClientRect().top + chat.scrollTop - 12);
+};
+$('prompt-form').onsubmit = event => { event.preventDefault(); if ($('prompt').value.trim()) command(busy ? 'steer' : 'prompt', $('prompt').value); };
+$('next-turn').onclick = () => { if ($('prompt').value.trim()) command('followUp', $('prompt').value); };
 $('interrupt').onclick = () => command('interrupt');
 $('prompt').onkeydown = event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); $('prompt-form').requestSubmit(); } };
 // Same-document navigation to another pairing link does not reload this module.
@@ -299,3 +445,72 @@ setInterval(() => {
 }, 10000);
 
 setInterval(refreshSessions, 10000);
+
+// Render an allowlisted DOM, never HTML strings. Raw HTML/images stay literal.
+function renderMarkdown(parent, text) {
+  const node = (tag, text) => {
+    const el = document.createElement(tag);
+    if (text !== undefined) el.textContent = text;
+    return el;
+  };
+  const literal = (parent, text) => parent.append(node('span', text || ''));
+  const inline = (parent, tokens) => {
+    for (const token of tokens || []) {
+      const tag = { strong: 'strong', em: 'em', del: 'del' }[token.type];
+      if (tag) { const el = node(tag); inline(el, token.tokens); parent.append(el); }
+      else if (token.type === 'codespan') parent.append(node('code', token.text));
+      else if (token.type === 'br') parent.append(node('br'));
+      else if (token.type === 'link') {
+        let url;
+        try { url = new URL(token.href); } catch {}
+        if (url && ['https:', 'http:', 'mailto:'].includes(url.protocol) && !url.username && !url.password) {
+          const el = node('a'); el.href = url.href; el.rel = 'noopener noreferrer';
+          inline(el, token.tokens); parent.append(el);
+        } else inline(parent, token.tokens);
+      } else if (token.type === 'text' && token.tokens) inline(parent, token.tokens);
+      else literal(parent, ['html', 'image'].includes(token.type) ? token.raw : token.text ?? token.raw);
+    }
+  };
+  const blocks = (parent, tokens) => {
+    for (const token of tokens) {
+      if (['space', 'def'].includes(token.type)) continue;
+      if (token.type === 'code') {
+        const pre = node('pre'); pre.append(node('code', token.text)); parent.append(pre);
+      } else if (['heading', 'paragraph', 'text'].includes(token.type)) {
+        const el = node(token.type === 'heading' ? `h${token.depth}` : 'p');
+        if (token.tokens) inline(el, token.tokens); else literal(el, token.text);
+        parent.append(el);
+      } else if (token.type === 'blockquote') {
+        const el = node('blockquote'); blocks(el, token.tokens); parent.append(el);
+      } else if (token.type === 'list') {
+        const list = node(token.ordered ? 'ol' : 'ul');
+        if (token.ordered && Number.isSafeInteger(token.start)) list.start = token.start;
+        for (const item of token.items) {
+          const li = node('li');
+          if (item.task) literal(li, item.checked ? '☑ ' : '☐ ');
+          blocks(li, item.tokens); list.append(li);
+        }
+        parent.append(list);
+      } else if (token.type === 'hr') parent.append(node('hr'));
+      else if (token.type === 'table') {
+        const table = node('table'), head = node('thead'), row = node('tr'), body = node('tbody');
+        for (const cell of token.header) { const el = node('th'); inline(el, cell.tokens); row.append(el); }
+        head.append(row); table.append(head);
+        for (const cells of token.rows) {
+          const row = node('tr');
+          for (const cell of cells) { const el = node('td'); inline(el, cell.tokens); row.append(el); }
+          body.append(row);
+        }
+        table.append(body); parent.append(table);
+      } else literal(parent, token.raw);
+    }
+  };
+  try { blocks(parent, marked.lexer(text, { gfm: true })); }
+  catch { parent.replaceChildren(node('pre', text)); }
+}
+$('markdown-toggle').onclick = () => {
+  markdownEnabled = !markdownEnabled;
+  $('markdown-toggle').textContent = `Markdown: ${markdownEnabled ? 'On' : 'Off'}`;
+  $('markdown-toggle').setAttribute('aria-pressed', String(markdownEnabled));
+  if (latestState) render(latestState, true);
+};

@@ -4,25 +4,42 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="theme-color" content="#10151e"><meta name="referrer" content="no-referrer">
   <title>Pi Remote</title><link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/style.css">
-  <script type="module" src="/app.js"></script>
+  <script defer src="/marked.js"></script><script type="module" src="/app.js"></script>
 </head>
 <body>
   <main>
-    <header><div><h1>π remote</h1><p id="session">Your coding agent, anywhere.</p></div><div id="auth-controls"><button id="disconnect" hidden>Sessions</button><button id="logout" hidden>Sign out</button></div></header>
+    <header class="app-header">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">π</span><div class="brand-copy"><h1>remote</h1><p id="session">Your coding agent, anywhere.</p></div></div>
+      <nav id="auth-controls" aria-label="Session navigation">
+        <button id="disconnect" class="nav-button nav-back" type="button" aria-label="Back to sessions" title="Back to sessions" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 5-7 7 7 7M5 12h14"/></svg><span id="disconnect-label" class="nav-label">Sessions</span></button>
+        <button id="settings-toggle" class="nav-button nav-icon" type="button" aria-label="Chat settings" title="Chat settings" aria-controls="settings-panel" aria-expanded="false" aria-haspopup="dialog" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 3-.6 2.3-2 .9-2.1-.7-2 3.5 1.6 1.7v2.6L2.3 15l2 3.5 2.1-.7 2 .9L9 21h4l.6-2.3 2-.9 2.1.7 2-3.5-1.6-1.7v-2.6L19.7 9l-2-3.5-2.1.7-2-.9L13 3Z"/><circle cx="11" cy="12" r="3"/></svg></button>
+        <button id="logout" class="nav-button nav-icon nav-logout" type="button" aria-label="Sign out" title="Sign out" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5H5v14h5m5-12 5 5-5 5m-6-5h11"/></svg></button>
+      </nav>
+    </header>
     <section id="login" hidden><h2>Sign in to Pi Remote</h2><p>Only the configured Google account can access remote sessions.</p><a class="button" href="/auth/google/start">Sign in with Google</a></section>
-    <section id="dashboard" hidden><h2>Remote sessions</h2><p id="account" class="muted"></p><p>Choose a connected Pi session.</p><div id="session-list"></div><button id="refresh-sessions">Refresh sessions</button></section>
-    <section id="pair"><h2>Connect to your session</h2><p>Run <code>/remote</code> in pi, then scan its QR code with this phone's camera—or paste its private pairing link below.</p>
-      <form id="pair-form"><label for="pair-link">Pairing link</label><input id="pair-link" type="password" autocomplete="off" placeholder="https://relay.example/#room=…&key=…" required><button>Connect</button></form>
-      <p class="muted">Anyone with the link can control your agent. Run <code>/remote off</code> in pi to revoke access.</p>
+    <section id="dashboard" hidden aria-labelledby="dashboard-title">
+      <div class="dashboard-heading"><div><p class="eyebrow">Your workspace</p><h2 id="dashboard-title">Remote sessions</h2></div><button id="refresh-sessions" type="button" aria-label="Refresh sessions">↻ Refresh</button></div>
+      <p id="session-summary" class="muted" role="status">Loading sessions…</p>
+      <div id="session-list" aria-label="Connected sessions"></div>
+      <div class="dashboard-footer"><p id="account" class="muted"></p><span class="muted">Updates every 10s</span></div>
     </section>
     <section id="workspace" hidden>
-      <div class="statusbar"><span id="status" role="status">Connecting…</span><button id="interrupt" disabled>Stop agent</button></div>
+      <section id="settings-panel" popover="auto" role="dialog" aria-labelledby="settings-title" hidden>
+        <div class="settings-heading"><div><p class="eyebrow">Preferences</p><h2 id="settings-title">Chat settings</h2></div><button id="settings-close" type="button" aria-label="Close settings" title="Close settings">×</button></div>
+        <section class="settings-account" aria-label="Model and plan">
+          <div class="settings-model"><span class="settings-meta-label">Active model</span><strong id="active-model">Not available</strong><span id="active-model-provider" class="muted"></span></div>
+          <div class="settings-usage"><div class="usage-heading"><span class="settings-meta-label">Weekly plan usage</span><strong id="weekly-usage">Not available</strong></div><progress id="weekly-usage-bar" max="100" value="0" aria-label="Weekly plan usage used" hidden></progress><p id="weekly-usage-detail" class="muted">Usage is reported by your subscription provider.</p></div>
+        </section>
+        <div class="settings-preference"><div><span class="preference-name">Render Markdown</span><p class="muted">Format assistant replies. Tools stay plain text.</p></div><button id="markdown-toggle" type="button" aria-pressed="false">Markdown: Off</button></div>
+        <form id="rename-form"><label for="session-name">Session name</label><input id="session-name" type="text" maxlength="256" required autocomplete="off" aria-describedby="rename-help"><p id="rename-help" class="muted" role="status"></p><div class="settings-actions"><button id="settings-cancel" type="button">Cancel</button><button id="rename-save" type="submit" disabled>Save name</button></div></form>
+      </section>
+      <div class="statusbar"><span id="status" role="status">Connecting…</span><div class="view-actions"><button id="last-user" type="button" disabled aria-label="Scroll to your last message" title="Scroll to your last message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 12 6-6 6 6M12 6v14M5 3h14"/></svg><span class="jump-label">Last message</span></button><button id="interrupt" disabled>Stop agent</button></div></div>
       <div id="chat" role="region" aria-label="Conversation" tabindex="0">
         <div id="messages"></div>
         <p id="activity" class="muted"></p>
         <div id="tool-calls" aria-label="Running tool inputs" hidden></div>
       </div>
-      <form id="prompt-form"><label for="prompt">Message your agent</label><textarea id="prompt" rows="3" maxlength="16000" placeholder="What should we work on?" required></textarea><div class="send-row"><span class="muted">Enter for newline · Ctrl/⌘ Enter to send</span><button id="send" disabled>Send</button></div></form>
+      <form id="prompt-form"><label for="prompt">Message your agent</label><textarea id="prompt" rows="3" maxlength="16000" placeholder="What should we work on?" required></textarea><div class="send-row"><span class="muted">Enter for newline · Ctrl/⌘ Enter to send</span><div class="send-actions"><button id="next-turn" type="button" disabled hidden title="Wait until the agent finishes its current work">Next turn</button><button id="send" disabled>Send</button></div></div></form>
     </section>
     <p id="notice" role="status"></p>
   </main>

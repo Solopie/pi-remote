@@ -12,8 +12,9 @@ import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot, toolCallDetails } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
+import { fetchWeeklyUsage, unavailableUsage } from '../src/usage.js';
 
-async function extension(t, branch = [], trustRelay = false) {
+async function extension(t, branch = [], trustRelay = false, options = {}) {
   const timers = new Map(), sockets = [], events = new Map(), notices = [], statuses = [], prompts = [], starts = [];
   let nextTimer = 0, handler, idle = true, interrupts = 0;
   const clock = {
@@ -37,7 +38,7 @@ async function extension(t, branch = [], trustRelay = false) {
     close() { this.finish(1000); }
     terminate() { this.terminated = true; this.finish(1006); }
   }
-  const ctx = { cwd: '/tmp/project', isIdle: () => idle, hasPendingMessages: () => false, abort: () => interrupts++,
+  const ctx = { model: options.model, cwd: '/tmp/project', isIdle: () => idle, hasPendingMessages: () => false, abort: () => interrupts++,
     sessionManager: { getSessionId: () => 'test', getBranch: () => branch },
     ui: { setStatus: (_name, text) => statuses.push(text), notify: text => notices.push(text) } };
   const pi = { registerCommand: (_name, command) => { handler = command.handler; }, on: (name, fn) => events.set(name, fn),
@@ -52,7 +53,7 @@ async function extension(t, branch = [], trustRelay = false) {
     .replace(/^import .*;\n/gm, '').replace('export default function', 'function');
   const context = vm.createContext({ pi, WebSocket: HostSocket, AsyncLocalStorage, AbortController, URL, Buffer, join: pathJoin,
     getAgentDir: () => '/unused-pi-remote-test', process: { env: { PI_REMOTE_URL: 'http://localhost:8787', PI_REMOTE_TOKEN: randomToken(), PI_REMOTE_TRUST_RELAY: String(trustRelay) } },
-    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails, normalizeRelayURL, readConfig, saveConfig, resolveConfig, pairingMessage,
+    randomToken, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails, normalizeRelayURL, readConfig, saveConfig, resolveConfig, fetchWeeklyUsage: options.usageFetcher || fetchWeeklyUsage, unavailableUsage, pairingMessage,
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout });
   vm.runInContext(`${source}\nremoteExtension(pi);`, context);
   await handler('', ctx);
@@ -296,6 +297,7 @@ async function browser({ importKey = (...args) => crypto.subtle.importKey(...arg
     scrollHeight: 0, scrollTop: 0, clientHeight: 0,
     append(...nodes) { for (const node of nodes) this.children.push(...(node.tag === 'fragment' ? node.children : [node])); },
     replaceChildren(...nodes) { this.children = []; this.append(...nodes); },
+    setAttribute(name, value) { this[name] = value; },
     querySelectorAll(selector) {
       const result = [];
       const visit = node => { if (node.tag === 'details' && (selector === 'details' || (selector === 'details[open]' && node.open))) result.push(node); for (const child of node.children) visit(child); };
@@ -323,6 +325,7 @@ async function browser({ importKey = (...args) => crypto.subtle.importKey(...arg
     } }, addEventListener: (type, fn) => listeners.set(type, fn),
     setTimeout: (fn, ms) => { const id = ++nextTimer; timers.set(id, { fn, ms }); return id; },
     clearTimeout: id => timers.delete(id), setInterval() {} });
+  vm.runInContext(await readFile(new URL('../public/marked.js', import.meta.url), 'utf8'), context);
   vm.runInContext(await readFile(new URL('../public/app.js', import.meta.url), 'utf8'), context);
   vm.runInContext("cryptoKey=importedKey; credentials={room:'test'}; connect(generation); connected=true; online=true;", context);
   async function receive(type, value, encryptedType = type) {
@@ -335,7 +338,7 @@ async function browser({ importKey = (...args) => crypto.subtle.importKey(...arg
     navigate(link) { const url = new URL(link); location.href = url.href; location.hash = url.hash; return listeners.get('hashchange')(); },
     eval: expression => vm.runInContext(expression, context) };
 }
-const snapshot = (revision, overrides = {}) => ({ revision, busy: true, submitting: false, name: 'current', tools: [], messages: [], ...overrides });
+const snapshot = (revision, overrides = {}) => ({ revision, capabilities: ['rename'], busy: true, submitting: false, name: 'current', tools: [], messages: [], ...overrides });
 
 test('browser and Node authenticate both direction and type, rejecting relabelled ACKs and legacy ciphertext', async () => {
   const h = await browser();
@@ -435,7 +438,8 @@ test('dashboard requires login, renders names as text, and selects sessions with
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(h.element('dashboard').hidden, false);
   const button = h.element('session-list').children[0]; assert.equal(button.tag, 'button');
-  assert.equal(button.textContent, '<img src=x onerror=alert(1)>');
+  assert.equal(button.children[1].children[0].children[0].textContent, '<img src=x onerror=alert(1)>');
+  assert.equal(button.children[1].children[0].children[1].textContent, 'Status unknown');
   await button.onclick(); assert.equal(h.eval('credentials.room'), room);
   assert.equal(h.element('workspace').hidden, false); assert.equal(h.element('dashboard').hidden, true);
   assert.equal(h.location.hash, ''); assert.ok(!h.location.href.includes(key));
@@ -444,13 +448,32 @@ test('dashboard requires login, renders names as text, and selects sessions with
   assert.equal(calls.at(-1).options.headers['X-CSRF-Token'], 'csrf-token');
 });
 
+test('dashboard displays running, idle and unknown activity without changing pairing availability', async () => {
+  for (const [status, label] of [['running', 'Running'], ['idle', 'Idle'], ['unknown', 'Status unknown'], [undefined, 'Status unknown']]) {
+    const h = await browser({ fetch: async path => ({ ok: true, status: 200, json: async () => path === '/api/auth'
+      ? { enabled: true, authenticated: true, email: 'owner@example.com', csrf: 'csrf-token' }
+      : { sessions: [{ room: randomToken(), name: 'Session', connectable: true, status },
+        { room: randomToken(), name: 'Private', connectable: false, status: 'unknown' }] } }) });
+    await new Promise(resolve => setImmediate(resolve));
+    const [session, privateSession] = h.element('session-list').children;
+    assert.equal(session.children[1].children[0].children[0].textContent, 'Session');
+    assert.equal(session.children[1].children[0].children[1].textContent, label);
+    assert.ok(session.children[1].children[0].children[1].className.includes(`badge-${status || 'unknown'}`));
+    assert.match(h.element('session-summary').textContent, /2 connected sessions/);
+    assert.equal(session.disabled, false);
+    assert.equal(privateSession.children[1].children[0].children[0].textContent, 'Private');
+    assert.equal(privateSession.children[1].children[1].textContent, 'Pairing required · open its private link');
+    assert.equal(privateSession.disabled, true);
+  }
+});
+
 test('unavailable authentication status fails closed, and unauthenticated Google mode cannot pair directly', async () => {
   const failure = await browser({ fetch: async () => { throw Error('unavailable'); } });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(failure.eval('authChecking'), true); assert.equal(failure.element('pair').hidden, true);
+  assert.equal(failure.eval('authChecking'), true); assert.equal(failure.element('workspace').hidden, true);
   const h = await browser({ fetch: async () => ({ ok: true, json: async () => ({ enabled: true, authenticated: false }) }) });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(h.element('login').hidden, false); assert.equal(h.element('pair').hidden, true);
+  assert.equal(h.element('login').hidden, false); assert.equal(h.element('workspace').hidden, true);
   const before = h.sockets.length;
   await h.navigate(`https://relay.test/#room=${randomToken()}&key=${randomToken()}`);
   assert.equal(h.sockets.length, before); assert.equal(h.location.hash, '');
@@ -549,4 +572,278 @@ test('browser retries temporary capacity rejection but stops on permanent revoca
   second.onopen(); assert.equal(second.sent[0].room, 'test');
   second.onclose({ code: 1008 });
   assert.equal(h.timers.size, 0); assert.match(h.element('notice').textContent, /revoked/);
+});
+
+
+test('Markdown is opt-in, repaints existing and streamed replies, and leaves tools/users literal', async () => {
+  const h = await browser();
+  const messages = [{ role: 'assistant', text: '# Heading\n\n**Bold** and `code`\n\n- first\n- second\n\n```js\nconst x = 1;\n```',
+    thinking: '**private thinking**', timestamp: 1 },
+    { role: 'user', text: '**user**' }, { role: 'toolResult', text: '**tool**' }];
+  await h.receive('state', snapshot(1, { messages }));
+  const pane = () => h.element('messages').children;
+  assert.equal(h.eval('markdownEnabled'), false);
+  assert.equal(pane()[0].children.at(-1).tag, 'pre');
+  const details = pane()[0].children.find(n => n.tag === 'details'); details.open = true;
+  h.element('chat').scrollHeight = 2000; h.element('chat').clientHeight = 500; h.element('chat').scrollTop = 200;
+  h.element('markdown-toggle').onclick();
+  assert.equal(h.element('markdown-toggle')['aria-pressed'], 'true');
+  assert.equal(h.element('markdown-toggle').textContent, 'Markdown: On');
+  assert.equal(h.eval('revision'), 1);
+  const rendered = pane()[0].children.at(-1);
+  assert.equal(rendered.className, 'markdown');
+  assert.equal(rendered.children[0].tag, 'h1');
+  assert.equal(rendered.children[1].children[0].tag, 'strong');
+  assert.ok(rendered.children.some(n => n.tag === 'ul'));
+  assert.ok(rendered.children.some(n => n.tag === 'pre' && n.children[0].tag === 'code'));
+  assert.equal(pane()[1].children.at(-1).tag, 'pre');
+  assert.equal(pane()[2].children.at(-1).children[1].textContent, '**tool**');
+  assert.equal(pane()[0].children.find(n => n.tag === 'details').open, true);
+  assert.equal(h.element('chat').scrollTop, 200);
+  await h.receive('state', snapshot(2, { messages: [{ role: 'assistant', text: '**streaming**' }] }));
+  assert.equal(pane()[0].children.at(-1).children[0].children[0].tag, 'strong');
+  h.element('markdown-toggle').onclick();
+  assert.equal(pane()[0].children.at(-1).textContent, '**streaming**');
+  assert.equal(h.element('markdown-toggle')['aria-pressed'], 'false');
+  await h.receive('state', snapshot(1)); assert.equal(h.eval('revision'), 2);
+});
+
+test('Markdown does not create executable HTML, remote images or unsafe links', async () => {
+  const h = await browser();
+  const text = '<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\n[bad](javascript:alert%281%29) [data](data:text/html,bad) [safe](https://example.com) ![image](https://example.com/tracker)';
+  await h.receive('state', snapshot(1, { messages: [{ role: 'assistant', text }] }));
+  h.element('markdown-toggle').onclick();
+  const nodes = [];
+  const visit = node => { nodes.push(node); for (const child of node.children) visit(child); };
+  visit(h.element('messages'));
+  assert.ok(!nodes.some(n => ['script', 'img', 'iframe'].includes(n.tag)));
+  const links = nodes.filter(n => n.tag === 'a');
+  assert.equal(links.length, 1); assert.equal(links[0].href, 'https://example.com/');
+  assert.ok(nodes.some(n => n.textContent.includes('<script>')));
+  assert.ok(nodes.some(n => n.textContent.includes('<img')));
+});
+
+
+test('home has no pairing form and private-link deployments explain direct navigation', async () => {
+  const html = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
+  assert.ok(!html.includes('id="pair"'));
+  assert.ok(!html.includes('id="pair-form"'));
+  assert.ok(!html.includes('id="pair-link"'));
+  const h = await browser({ fetch: async () => ({ ok: true, status: 200,
+    json: async () => ({ enabled: false, authenticated: false }) }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(h.element('notice').textContent, /Open your private pairing link/);
+  const link = `https://relay.test/#room=${randomToken()}&key=${randomToken()}`;
+  await h.navigate(link);
+  assert.equal(h.element('workspace').hidden, false);
+  assert.equal(h.location.hash, '');
+});
+
+
+test('session cards show a helpful empty state and correct counts', async () => {
+  const h = await browser();
+  h.context.sessions = [];
+  h.eval('renderSessionList(sessions)');
+  const empty = h.element('session-list').children[0];
+  assert.equal(empty.className, 'sessions-empty');
+  assert.equal(empty.children[1].textContent, 'No sessions yet');
+  h.context.sessions = [{ room: randomToken(), name: 'x'.repeat(256), connectable: true, status: 'running' }];
+  h.eval('renderSessionList(sessions)');
+  assert.equal(h.element('session-summary').textContent, '1 connected session · 1 running');
+  assert.equal(h.element('session-list').children[0].children[1].children[0].children[0].textContent.length, 256);
+});
+
+
+test('chat settings rename the session without touching message drafts, even while running', async () => {
+  const h = await browser();
+  h.element('settings-panel').hidden = true;
+  await h.receive('state', snapshot(1, { name: 'Old name', submitting: true }));
+  h.element('settings-toggle').onclick();
+  assert.equal(h.element('settings-panel').hidden, false);
+  assert.equal(h.element('session-name').value, 'Old name');
+  assert.equal(h.element('rename-save').disabled, false);
+  h.eval("crypto.randomUUID = () => 'rename12'; sent = []; sendCommand = async value => sent.push(value)");
+  h.element('prompt').value = 'My next prompt';
+  h.element('session-name').value = '  New name  ';
+  h.element('rename-form').onsubmit({ preventDefault() {} });
+  assert.equal(h.eval('sent.at(-1).action'), 'rename');
+  assert.equal(h.eval('sent.at(-1).text'), 'New name');
+  assert.equal(h.element('rename-save').disabled, true);
+  await h.receive('ack', { id: 'rename12', ok: false, error: 'Rename failed' });
+  assert.equal(h.element('settings-panel').hidden, false);
+  assert.equal(h.element('session-name').value, '  New name  ');
+  h.element('rename-form').onsubmit({ preventDefault() {} });
+  await h.receive('ack', { id: 'rename12', ok: true });
+  assert.equal(h.element('settings-panel').hidden, true);
+  assert.equal(h.element('prompt').value, 'My next prompt');
+  assert.equal(h.element('notice').textContent, 'Session renamed.');
+  await h.receive('state', snapshot(2, { name: 'New name' }));
+  assert.equal(h.element('session').textContent, 'New name');
+  h.element('settings-toggle').onclick();
+  assert.equal(h.element('session-name').value, 'New name');
+  for (const name of [' ', 'x'.repeat(257), 'bad\nname']) {
+    h.element('session-name').value = name;
+    h.element('rename-form').onsubmit({ preventDefault() {} });
+    assert.equal(h.eval('sent.length'), 2);
+  }
+  h.element('settings-cancel').onclick();
+  assert.equal(h.element('settings-panel').hidden, true);
+  h.eval('disconnect()');
+  assert.equal(h.element('settings-toggle').hidden, true);
+});
+
+test('rename command validation enforces bounded, nonblank single-line names', () => {
+  for (const text of ['New name', '<script>literal name</script>', 'x'.repeat(256)]) {
+    assert.ok(validCommand({ id: 'rename12', action: 'rename', text }));
+  }
+  for (const text of [undefined, '', ' ', 'x'.repeat(257), 'bad\nname', 'bad\x00name']) {
+    assert.ok(!validCommand({ id: 'rename12', action: 'rename', text }));
+  }
+});
+
+test('chat navigation keeps icon buttons labelled and preserves their contents when auth changes', async () => {
+  const html = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
+  assert.match(html, /<nav id="auth-controls" aria-label="Session navigation">/);
+  assert.match(html, /id="settings-toggle"[^>]*aria-label="Chat settings"/);
+  assert.match(html, /id="logout"[^>]*aria-label="Sign out"/);
+  const h = await browser();
+  const icon = { tag: 'svg' }; h.element('disconnect').children.push(icon);
+  h.eval('authEnabled = true; home()');
+  assert.equal(h.element('disconnect-label').textContent, 'Sessions');
+  assert.equal(h.element('disconnect')['aria-label'], 'Back to sessions');
+  assert.equal(h.element('disconnect').children[0], icon);
+  h.eval('authEnabled = false; home()');
+  assert.equal(h.element('disconnect-label').textContent, 'Disconnect');
+  assert.equal(h.element('disconnect')['aria-label'], 'Disconnect from session');
+  await h.receive('state', snapshot(1, { name: 'Long session name' }));
+  assert.equal(h.element('session').title, 'Long session name');
+});
+
+
+test('older extensions cannot silently accept a rename and explain how to upgrade', async () => {
+  const h = await browser();
+  h.element('settings-panel').hidden = true;
+  await h.receive('state', snapshot(1, { capabilities: undefined, name: 'Old extension' }));
+  h.element('settings-toggle').onclick();
+  assert.equal(h.element('rename-save').disabled, true);
+  assert.equal(h.element('session-name').disabled, true);
+  assert.match(h.element('rename-help').textContent, /older remote extension/);
+  h.eval('sent = []; sendCommand = async value => sent.push(value)');
+  h.element('session-name').value = 'New name';
+  h.element('rename-form').onsubmit({ preventDefault() {} });
+  assert.equal(h.eval('sent.length'), 0);
+  await h.receive('state', snapshot(2, { capabilities: ['rename'] }));
+  assert.equal(h.element('rename-save').disabled, false);
+  assert.equal(h.element('session-name').disabled, false);
+});
+
+test('last-message button scrolls only the conversation to the latest user message', async () => {
+  const h = await browser();
+  await h.receive('state', snapshot(1));
+  assert.equal(h.element('last-user').disabled, true);
+  await h.receive('state', snapshot(2, { messages: [
+    { role: 'user', text: 'First prompt' }, { role: 'assistant', text: 'First reply' },
+    { role: 'user', text: 'Latest prompt' }, { role: 'assistant', text: 'Long reply' }
+  ] }));
+  const articles = h.element('messages').children;
+  const chat = h.element('chat'); chat.scrollTop = 300;
+  chat.getBoundingClientRect = () => ({ top: 100 });
+  articles[0].getBoundingClientRect = () => ({ top: 20 });
+  articles[2].getBoundingClientRect = () => ({ top: 240 });
+  assert.equal(h.element('last-user').disabled, false);
+  h.element('last-user').onclick();
+  assert.equal(chat.scrollTop, 428);
+  await h.receive('state', snapshot(3, { messages: [{ role: 'assistant', text: 'No user in retained history' }] }));
+  assert.equal(h.element('last-user').disabled, true);
+  h.eval('disconnect()');
+  assert.equal(h.element('last-user').disabled, true);
+});
+
+
+test('settings pop-up contains Markdown, stays open while toggling it, and dismisses cleanly', async () => {
+  const html = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
+  const settings = html.slice(html.indexOf('<section id="settings-panel"'), html.indexOf('<div class="statusbar">'));
+  assert.match(settings, /popover="auto" role="dialog"/);
+  assert.match(settings, /id="markdown-toggle"/);
+  assert.equal(html.split('id="markdown-toggle"').length - 1, 1);
+  const h = await browser();
+  const panel = h.element('settings-panel'); panel.hidden = true;
+  let shown = 0, hidden = 0;
+  panel.showPopover = () => shown++;
+  panel.hidePopover = () => hidden++;
+  await h.receive('state', snapshot(1, { messages: [{ role: 'assistant', text: '**Bold**' }] }));
+  h.element('settings-toggle').onclick();
+  assert.equal(shown, 1);
+  h.element('markdown-toggle').onclick();
+  assert.equal(panel.hidden, false);
+  assert.equal(h.element('markdown-toggle')['aria-pressed'], 'true');
+  panel.ontoggle({ newState: 'closed' });
+  assert.equal(panel.hidden, true);
+  assert.equal(h.element('settings-toggle')['aria-expanded'], 'false');
+  h.element('settings-toggle').onclick();
+  h.element('settings-close').onclick();
+  assert.equal(hidden, 1);
+  assert.equal(panel.hidden, true);
+  delete panel.showPopover; delete panel.hidePopover;
+  h.element('settings-toggle').onclick();
+  h.context.event = { target: h.element('settings-toggle') };
+  h.eval('dismissSettingsOutside(event)');
+  assert.equal(panel.hidden, false);
+  h.context.event = { target: h.element('chat') };
+  h.eval('dismissSettingsOutside(event)');
+  assert.equal(panel.hidden, true);
+});
+
+
+test('settings display authoritative model and weekly usage with explicit unavailable states', async () => {
+  const h = await browser();
+  const model = { id: 'gpt-test', name: 'GPT Test', provider: 'openai-codex' };
+  const planUsage = { provider: 'openai-codex', status: 'available', usedPercent: 66.4,
+    resetsAt: 1800003600000, updatedAt: 1800000000000, plan: 'plus' };
+  await h.receive('state', snapshot(1, { model, planUsage }));
+  assert.equal(h.element('active-model').textContent, 'GPT Test');
+  assert.equal(h.element('active-model-provider').textContent, 'openai-codex · gpt-test');
+  assert.equal(h.element('weekly-usage').textContent, '66% used');
+  assert.equal(h.element('weekly-usage-bar').value, 66.4);
+  assert.equal(h.element('weekly-usage-bar').hidden, false);
+  assert.match(h.element('weekly-usage-detail').textContent, /plus plan.*Resets/);
+  await h.receive('state', snapshot(2, { model, planUsage: { ...planUsage, usedPercent: 0 } }));
+  assert.equal(h.element('weekly-usage').textContent, '0% used');
+  await h.receive('state', snapshot(3, { model: { ...model, provider: 'another' }, planUsage }));
+  assert.equal(h.element('weekly-usage-bar').hidden, true);
+  assert.equal(h.element('weekly-usage').textContent, 'Not available');
+  for (const invalid of [{ ...planUsage, usedPercent: 101 }, { ...planUsage, usedPercent: '66' }, { ...planUsage, status: 'bad' }]) {
+    await h.receive('state', snapshot(4, { model, planUsage: invalid }));
+    assert.equal(h.eval('revision'), 3);
+  }
+  await h.receive('state', snapshot(4, { model, planUsage: { ...planUsage, status: 'loading', usedPercent: null } }));
+  assert.equal(h.element('weekly-usage').textContent, 'Checking…');
+  await h.receive('state', snapshot(5));
+  assert.equal(h.element('active-model').textContent, 'Not available');
+  assert.equal(h.element('weekly-usage-bar').hidden, true);
+});
+
+test('usage refresh follows model switches, ignores stale requests, and stops when remote is disabled', async t => {
+  const pending = [], model = { id: 'first', name: 'First', provider: 'openai-codex' };
+  const h = await extension(t, [], false, { model, usageFetcher: (model, _registry, options) => new Promise(resolve => pending.push({ model, options, resolve })) });
+  const states = () => h.sockets[0].sent.filter(p => p.type === 'state').map(p => open(h.key, p.payload, 'host', 'state'));
+  h.clock.run(150);
+  assert.equal(states().at(-1).model.id, 'first');
+  assert.equal(states().at(-1).planUsage.status, 'loading');
+  h.ctx.model = { id: 'second', name: 'Second', provider: 'anthropic' };
+  h.events.get('model_select')({}, h.ctx);
+  assert.equal(pending[0].options.signal.aborted, true);
+  pending[0].resolve({ ...unavailableUsage('openai-codex'), status: 'available', usedPercent: 99 });
+  await new Promise(resolve => setImmediate(resolve));
+  h.clock.run(150);
+  assert.equal(states().at(-1).model.id, 'second');
+  assert.equal(states().at(-1).planUsage.provider, 'anthropic');
+  assert.equal(states().at(-1).planUsage.status, 'loading');
+  pending[1].resolve({ ...unavailableUsage('anthropic'), status: 'available', usedPercent: 42, updatedAt: Date.now() });
+  await new Promise(resolve => setImmediate(resolve));
+  h.clock.run(150);
+  assert.equal(states().at(-1).planUsage.usedPercent, 42);
+  assert.equal(h.clock.count(300000), 1);
+  await h.handler('off', h.ctx);
+  assert.equal(h.clock.count(300000), 0);
 });

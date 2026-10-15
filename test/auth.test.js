@@ -8,9 +8,9 @@ import { createRelay } from '../src/server.js';
 import { randomToken, seal, open } from '../src/crypto.js';
 
 const config = { clientId: 'test-client', clientSecret: 'private-oauth-secret', allowedEmail: 'owner@example.com', origin: 'https://relay.example' };
-async function fixture(t, options = {}) {
+async function fixture(t, options = {}, authConfig = config) {
   let nonce, exchange, claims = {};
-  const auth = createGoogleAuth(config, { fetchToken: async (_url, request) => {
+  const auth = createGoogleAuth(authConfig, { fetchToken: async (_url, request) => {
     exchange = new URLSearchParams(request.body); return { ok: true, json: async () => ({ id_token: 'signed-test-token' }) };
   }, verifyToken: async () => ({ sub: 'owner-subject', email: config.allowedEmail, email_verified: true, nonce, ...claims }), ...options });
   const token = randomToken(), relay = createRelay({ token, auth });
@@ -142,4 +142,70 @@ test('unauthenticated sockets cannot bypass Google using a known room, and brows
     const browser = new WebSocket(`ws://127.0.0.1:${h.relay.server.address().port}/ws`, { headers });
     browser.on('error', () => {}); await new Promise(resolve => browser.once('close', resolve));
   }
+});
+
+test('dashboard activity follows trusted encrypted snapshots and resets on reconnect', async t => {
+  const h = await fixture(t), user = await h.login(), room = randomToken(), key = randomToken();
+  const host = await h.socket('host', room, '', { discovery: { name: 'Working session', key } }); await host.message;
+  const privateRoom = randomToken(), privateKey = randomToken();
+  const privateHost = await h.socket('host', privateRoom); await privateHost.message;
+  const client = await h.socket('client', room, user.cookie); await client.message;
+  const list = async () => (await (await h.request('/api/sessions', user.cookie)).json()).sessions;
+  assert.equal((await list()).find(s => s.room === room).status, 'unknown');
+  let revision = 0;
+  const update = async (state, expected, encryptionKey = key, type = 'state') => {
+    const received = once(client.ws, 'message');
+    host.ws.send(JSON.stringify({ type: 'state', payload: seal(encryptionKey, { revision: ++revision, ...state }, 'host', type) }));
+    await received;
+    const sessions = await list();
+    assert.equal(sessions.find(s => s.room === room).status, expected);
+    assert.ok(!JSON.stringify(sessions).includes(key));
+  };
+  await update({ busy: false, submitting: false }, 'idle');
+  await update({ busy: true, submitting: false, name: 'Renamed chat' }, 'running');
+  assert.equal((await list()).find(s => s.room === room).name, 'Renamed chat');
+  await update({ busy: false, submitting: true }, 'running');
+  await update({ busy: false, submitting: false }, 'idle');
+  await update({ busy: 'false', submitting: false }, 'unknown');
+  await update({ busy: false, submitting: false }, 'unknown', randomToken());
+  await update({ busy: false, submitting: false }, 'unknown', key, 'ack');
+  // A non-enrolled session stays opaque even when its snapshot resembles status.
+  const privateClient = await h.socket('client', privateRoom, user.cookie); await privateClient.message;
+  const received = once(privateClient.ws, 'message');
+  privateHost.ws.send(JSON.stringify({ type: 'state', payload: seal(privateKey, { busy: true, submitting: false }, 'host', 'state') }));
+  await received;
+  assert.equal((await list()).find(s => s.room === privateRoom).status, 'unknown');
+  await update({ busy: true, submitting: false }, 'running');
+  const offline = once(client.ws, 'message'); host.ws.close(); await offline;
+  assert.equal((await list()).some(s => s.room === room), false);
+  const reconnected = await h.socket('host', room, '', { discovery: { name: 'Working session', key } }); await reconnected.message;
+  assert.equal((await list()).find(s => s.room === room).status, 'unknown');
+});
+
+
+test('preview uses the shared callback with isolated state and cookies', async t => {
+  const previewConfig = { ...config, origin: 'https://relay.example:18789',
+    redirectURI: 'https://relay.example/auth/google/callback', authNamespace: 'preview' };
+  const h = await fixture(t, {}, previewConfig), flow = await h.begin();
+  assert.equal(flow.url.searchParams.get('redirect_uri'), previewConfig.redirectURI);
+  assert.match(flow.state, /^pi_remote_preview_[A-Za-z0-9_-]{43}$/);
+  assert.match(flow.cookie, /^__Host-preview-pi-remote-flow=/);
+  assert.equal((await h.callback(flow, flow.cookie.replace('preview-pi-remote', 'pi-remote'))).status, 400);
+  const response = await h.callback(flow);
+  assert.equal(response.status, 303);
+  assert.equal(h.exchange.get('redirect_uri'), previewConfig.redirectURI);
+  const cookies = response.headers.getSetCookie();
+  assert.ok(cookies.every(cookie => cookie.startsWith('__Host-preview-pi-remote-')));
+  const cookie = cookies.find(cookie => cookie.startsWith('__Host-preview-pi-remote-session=')).split(';')[0];
+  assert.equal((await (await h.request('/api/auth', cookie)).json()).authenticated, true);
+  const legacy = await (await h.request('/api/auth', cookie.replace('preview-pi-remote', 'pi-remote'))).json();
+  assert.equal(legacy.authenticated, false);
+});
+
+test('shared callbacks reject foreign hosts, unsafe paths and invalid cookie namespaces', () => {
+  for (const redirectURI of ['https://evil.example/auth/google/callback', 'https://relay.example/other',
+    'https://relay.example/auth/google/callback?next=evil', 'http://relay.example/auth/google/callback']) {
+    assert.throws(() => createGoogleAuth({ ...config, redirectURI }));
+  }
+  assert.throws(() => createGoogleAuth({ ...config, authNamespace: '../invalid' }));
 });

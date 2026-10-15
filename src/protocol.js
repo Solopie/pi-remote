@@ -1,7 +1,9 @@
 export const MAX_PROMPT = 16000;
 export function validCommand(command) {
   return command && typeof command.id === 'string' && /^[a-zA-Z0-9-]{8,80}$/.test(command.id)
-    && (command.action === 'interrupt' || (command.action === 'prompt' && typeof command.text === 'string'
+    && (command.action === 'interrupt'
+      || (command.action === 'rename' && typeof command.text === 'string' && command.text.trim().length > 0
+        && command.text.length <= 256 && !/[\x00-\x1f\x7f]/.test(command.text)) || (['prompt', 'steer', 'followUp'].includes(command.action) && typeof command.text === 'string'
       && command.text.trim().length > 0 && command.text.length <= MAX_PROMPT));
 }
 // Only expose bounded, displayable text and tool inputs. Provider signatures,

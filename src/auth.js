@@ -18,7 +18,9 @@ export function googleConfig(env = process.env) {
   const values = [env.PI_REMOTE_GOOGLE_CLIENT_ID, env.PI_REMOTE_GOOGLE_CLIENT_SECRET, env.PI_REMOTE_ALLOWED_EMAIL, env.PI_REMOTE_PUBLIC_URL];
   if (values.every(value => value === undefined)) return undefined;
   if (values.some(value => !value?.trim())) throw Error('Google login requires PI_REMOTE_GOOGLE_CLIENT_ID, PI_REMOTE_GOOGLE_CLIENT_SECRET, PI_REMOTE_ALLOWED_EMAIL, and PI_REMOTE_PUBLIC_URL.');
-  return { clientId: values[0], clientSecret: values[1], allowedEmail: values[2], origin: values[3] };
+  return { clientId: values[0], clientSecret: values[1], allowedEmail: values[2], origin: values[3],
+    redirectURI: env.PI_REMOTE_GOOGLE_REDIRECT_URL?.trim() || undefined,
+    authNamespace: env.PI_REMOTE_AUTH_NAMESPACE?.trim() || undefined };
 }
 
 // Injectable transport/verifier/clock make tests independent of Google and model APIs.
@@ -29,11 +31,25 @@ export async function verifyGoogleToken(token, clientId, keys = jwks) {
 export function createGoogleAuth(config, { fetchToken = fetch, verifyToken = token => verifyGoogleToken(token, config.clientId),
   now = Date.now, sessionTTL = 8 * 60 * 60 * 1000 } = {}) {
   const origin = normalizeRelayURL(config.origin), secure = origin.startsWith('https:');
-  if (!config.clientId?.trim() || !config.clientSecret?.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(config.allowedEmail || '')) throw Error('Invalid Google login configuration.');
+  if (!config.clientId?.trim() || !config.clientSecret?.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(config.allowedEmail || '')
+    || (config.authNamespace && !/^[a-z0-9][a-z0-9-]{0,23}$/.test(config.authNamespace))) throw Error('Invalid Google login configuration.');
   const allowedEmail = config.allowedEmail.toLowerCase();
-  const redirectURI = `${origin}/auth/google/callback`;
-  const sessionCookie = secure ? '__Host-pi-remote-session' : 'pi-remote-session';
-  const flowCookie = secure ? '__Host-pi-remote-flow' : 'pi-remote-flow';
+  let callbackURL;
+  try { callbackURL = new URL(config.redirectURI || `${origin}/auth/google/callback`); }
+  catch { throw Error('Invalid Google callback configuration.'); }
+  const originURL = new URL(origin);
+  if (callbackURL.username || callbackURL.password || callbackURL.hostname !== originURL.hostname
+    || callbackURL.pathname !== '/auth/google/callback' || callbackURL.search || callbackURL.hash
+    || (callbackURL.protocol !== 'https:' && !(callbackURL.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(callbackURL.hostname)))) {
+    throw Error('Invalid Google callback configuration.');
+  }
+  const redirectURI = callbackURL.href;
+  const namespace = config.authNamespace || '';
+  // Preserve legacy unprefixed states and cookie names unless explicitly opted in.
+  const statePrefix = namespace ? `pi_remote_${namespace.replaceAll('-', '_')}_` : '';
+  const cookiePrefix = namespace ? `${namespace}-pi-remote` : 'pi-remote';
+  const sessionCookie = secure ? `__Host-${cookiePrefix}-session` : `${cookiePrefix}-session`;
+  const flowCookie = secure ? `__Host-${cookiePrefix}-flow` : `${cookiePrefix}-flow`;
   const flows = new Map(), sessions = new Map(), listeners = new Set();
   let exchanges = 0;
   const cookie = (name, value, age) => `${name}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${age}${secure ? '; Secure' : ''}`;
@@ -55,7 +71,7 @@ export function createGoogleAuth(config, { fetchToken = fetch, verifyToken = tok
       if (path === '/auth/google/start' && req.method === 'GET') {
         prune();
         if (flows.size >= 128) { json(res, 429, { error: 'Too many login attempts. Try again later.' }); return true; }
-        const state = randomToken(), binding = randomToken(), verifier = randomToken(), nonce = randomToken();
+        const state = `${statePrefix}${randomToken()}`, binding = randomToken(), verifier = randomToken(), nonce = randomToken();
         flows.set(state, { binding, verifier, nonce, expires: now() + 300000 });
         res.setHeader('Set-Cookie', cookie(flowCookie, binding, 300));
         const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');

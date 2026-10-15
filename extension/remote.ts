@@ -7,6 +7,7 @@ import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot, toolCallDetails } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
+import { fetchWeeklyUsage, unavailableUsage } from '../src/usage.js';
 
 type Message = NonNullable<ReturnType<typeof publicMessage>>;
 type Submission = { id: string; timer: ReturnType<typeof setTimeout>; timedOut: boolean };
@@ -21,6 +22,9 @@ export default function remoteExtension(pi: ExtensionAPI) {
   let operation: AbortController | undefined;
   let messages: Message[] = [], activeTools = new Map<string, ReturnType<typeof toolCallDetails>>();
   let revision = 0, submitting = false, streamingIndex = -1;
+  let usage = unavailableUsage('', 'loading');
+  let usageTimer: ReturnType<typeof setTimeout> | undefined, usageRequest: AbortController | undefined;
+  let usageAttempt = 0;
   let submission: Submission | undefined;
   const submissionContext = new AsyncLocalStorage<Submission>();
   const commands = new Map<string, { id: string; ok: boolean; error?: string }>();
@@ -45,7 +49,9 @@ export default function remoteExtension(pi: ExtensionAPI) {
       try {
         transmit('state', { revision: ++revision, session: ctx.sessionManager.getSessionId().slice(0, 256),
           name: (pi.getSessionName() || ctx.cwd.split('/').pop() || 'Pi session').slice(0, 256),
-          busy: !!submission || submitting || !ctx.isIdle(), submitting: !!submission,
+          busy: !!submission || submitting || !ctx.isIdle(), submitting: !!submission, capabilities: ['rename'],
+          model: ctx.model ? { id: ctx.model.id.slice(0, 256), name: ctx.model.name.slice(0, 256), provider: ctx.model.provider.slice(0, 128) } : null,
+          planUsage: usage,
           tools: [...activeTools.values()].slice(0, 100).map(tool => tool.name),
           activeToolCalls: [...activeTools.entries()].slice(0, 20).map(([id, tool]) => ({ ...tool, id: id.slice(0, 128) })), messages });
       } catch {
@@ -54,9 +60,35 @@ export default function remoteExtension(pi: ExtensionAPI) {
       }
     }, 150);
   }
+  async function refreshUsage(force = false) {
+    if (!enabled || usageRequest || (!force && Date.now() - usageAttempt < 60000)) return;
+    usageAttempt = Date.now();
+    const controller = new AbortController(); usageRequest = controller;
+    const model = ctx.model;
+    usage = unavailableUsage(model?.provider || '', 'loading'); publish();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const result = await fetchWeeklyUsage(model, ctx.modelRegistry, { signal: controller.signal });
+      if (enabled && usageRequest === controller && !controller.signal.aborted) { usage = result; publish(); }
+    } catch {
+      if (enabled && usageRequest === controller) { usage = unavailableUsage(model?.provider || ''); publish(); }
+    } finally {
+      clearTimeout(timeout);
+      if (usageRequest === controller) {
+        usageRequest = undefined;
+        if (enabled) {
+          if (controller.signal.aborted) { usage = unavailableUsage(model?.provider || ''); publish(); }
+          clearTimeout(usageTimer);
+          usageTimer = setTimeout(() => { void refreshUsage(true); }, 300000);
+        }
+      }
+    }
+  }
   function cancelOperation() { operation?.abort(); operation = undefined; }
   function stop() {
     cancelOperation();
+    clearTimeout(usageTimer); usageTimer = undefined;
+    usageRequest?.abort(); usageRequest = undefined; usageAttempt = 0; usage = unavailableUsage('', 'loading');
     enabled = false;
     clearTimeout(reconnect); clearTimeout(flush); flush = undefined;
     try {
@@ -93,7 +125,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
       try {
         const packet = JSON.parse(raw.toString());
         if (packet.type === 'joined') {
-          retry = 0; status('Remote ON · /remote off to revoke'); publish(); return;
+          retry = 0; status('Remote ON · /remote off to revoke'); publish(); void refreshUsage(); return;
         }
         if (packet.type !== 'command') return;
         const command = open(key, packet.payload, 'client', 'command');
@@ -108,14 +140,27 @@ export default function remoteExtension(pi: ExtensionAPI) {
           if (!Number.isFinite(command.createdAt) || Math.abs(Date.now() - command.createdAt) > 120000) {
             result.error = 'Command expired. Check device clocks and resend.';
           } else try {
-            if (command.action === 'interrupt') {
+            if (command.action === 'rename') {
+              pi.setSessionName(command.text.trim());
+              result.ok = true;
+            }
+            else if (command.action === 'interrupt') {
               // Pi cannot cancel asynchronous preflight through its void API.
               // Do not claim success when an idle/pending turn can still start.
               if (submission) result.error = 'Message submission is still pending and cannot be cancelled. Wait for the agent to start, then interrupt.';
               else if (ctx.isIdle()) result.error = 'No agent is running. A previously unconfirmed submission may still start; interrupt once it is running.';
               else { ctx.abort(); result.ok = true; }
             }
-            else if (submission || submitting || !ctx.isIdle() || ctx.hasPendingMessages()) result.error = 'Agent is busy. Wait or interrupt first.';
+            else if (submission) result.error = 'Agent is busy with an unconfirmed submission. Wait for it to start.';
+            else if (!ctx.isIdle()) {
+              // A normal Send may race with a locally started turn. Always steer
+              // in that case, unless the phone explicitly requested a follow-up.
+              // This void API confirms dispatch only, not asynchronous preflight.
+              pi.sendUserMessage(command.text, { expandPromptTemplates: false,
+                deliverAs: command.action === 'followUp' ? 'followUp' : 'steer' });
+              result.ok = true;
+            }
+            else if (submitting || ctx.hasPendingMessages()) result.error = 'Agent is busy. Wait for pending messages.';
             else {
               submitting = true;
               // Pi's void API swallows asynchronous preflight failures. Only acknowledge
@@ -132,7 +177,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
               // Pi 1.1.0 awaits preflight and emits agent_start in this call's async
               // context. Tag the invocation, not its text: input hooks may transform
               // the prompt, and a local turn (even with identical text) is unrelated.
-              submissionContext.run(submission, () => pi.sendUserMessage(command.text, { expandPromptTemplates: false }));
+              submissionContext.run(submission, () => pi.sendUserMessage(command.text, { expandPromptTemplates: false, deliverAs: command.action === 'followUp' ? 'followUp' : 'steer' }));
               publish(); return;
             }
           } catch (error) {
@@ -266,7 +311,11 @@ export default function remoteExtension(pi: ExtensionAPI) {
     publish();
   });
   pi.on('agent_end', (_event, context) => { ctx = context; submitting = false; activeTools.clear(); publish(); });
-  pi.on('agent_settled', (_event, context) => { ctx = context; submitting = false; publish(); });
+  pi.on('agent_settled', (_event, context) => { ctx = context; submitting = false; publish(); void refreshUsage(); });
+  pi.on('model_select', (_event, context) => {
+    ctx = context; clearTimeout(usageTimer); usageRequest?.abort(); usageRequest = undefined;
+    usage = unavailableUsage(ctx.model?.provider || '', 'loading'); publish(); void refreshUsage(true);
+  });
   pi.on('message_start', (event, context) => {
     ctx = context; if (!enabled) return;
     const message = publicMessage(event.message);

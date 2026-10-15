@@ -13,6 +13,7 @@ import { randomToken, seal, open } from '../src/crypto.js';
 import { publicMessage, validCommand, boundSnapshot, toolCallDetails } from '../src/protocol.js';
 import { normalizeRelayURL, readConfig, saveConfig, resolveConfig } from '../src/config.js';
 import { pairingMessage } from '../src/pairing.js';
+import { fetchWeeklyUsage, unavailableUsage } from '../src/usage.js';
 
 async function directory(t) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-remote-setup-'));
@@ -50,7 +51,7 @@ async function extension(t, { dir, env = {}, inputs = [], confirmations = [], ha
   const context = vm.createContext({ pi, WebSocket: Socket, AsyncLocalStorage, AbortController, URL, Buffer, Error, join,
     getAgentDir: () => dir, process: { env },
     randomToken: () => { generated++; return randomToken(); }, seal, open, publicMessage, validCommand, boundSnapshot, toolCallDetails,
-    normalizeRelayURL, readConfig, saveConfig: save, resolveConfig, pairingMessage,
+    normalizeRelayURL, readConfig, saveConfig: save, resolveConfig, fetchWeeklyUsage, unavailableUsage, pairingMessage,
     setTimeout: (fn, ms) => { const id = ++nextTimer; timers.set(id, { fn, ms }); return id; },
     clearTimeout: id => timers.delete(id) });
   vm.runInContext(`${source}\nremoteExtension(pi);`, context);
